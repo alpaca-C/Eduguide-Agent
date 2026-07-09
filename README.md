@@ -2,7 +2,7 @@
 
 > 基于 LLM 的文档知识图谱问答系统。用户上传教材/论文/笔记，系统自动检测章节结构、构建向量索引和知识图谱，支持基于资料的自然语言问答。
 >
-> 最后更新：2026-07-09（QA管道改进：多跳子问题依赖执行 + Router 分解种子复用）
+> 最后更新：2026-07-09（图片PDF章节检测全链路修复：VLM目录提取+本地OCR+页码范围定向导入+增量索引入库）
 
 ---
 
@@ -270,10 +270,18 @@ LLM 调用对比（vs 旧 ReAct+Reflection）：
 
 #### ChapterizerAgent (`chapterizer.py`)
 
-负责从文档前 20 页中检测一级章节。支持常规文字 PDF 和 OCR 扫描文本两种输入：
+负责从文档前 20 页中检测一级章节。支持常规文字 PDF、本地 OCR、VLM 目录提取三种路径：
 
 ```
-文档前 20 页（常规文字 或 VLM OCR 文本）
+文档前 20 页
+  │
+  ├── 数字 PDF (有嵌入文字): pymupdf 直接提取 → chapterizer (DeepSeek)
+  │
+  ├── 图片 PDF (无文字层): 本地 Tesseract OCR (6线程并行) + VLM TOC 扫描
+  │   └── VLM 提取目录页中章节标题 + 起始页码，计算各章节页码范围
+  │
+  ├── VLM 快速通道: 若 metadata 含 pre-detected 章节列表，跳过 LLM 检测
+  │   └── 直接 _split_by_meta + 审核，省一次 LLM 调用
   │
   ├── OCR 文本预处理: 超 15000 字智能截断 + 截断提示
   │
@@ -281,7 +289,6 @@ LLM 调用对比（vs 旧 ReAct+Reflection）：
        ├── 检测专家 (LLM) → 定位目录、提取章节
        │   └── 优先查找集中目录区，若无则遍历全文搜索"第X章"标题
        ├── 启发式快判 (_fast_check_pass)
-       │   └── ≥80% 章节标题匹配标准格式 → 跳过 LLM 审核
        ├── 审核专家 (LLM) → 逐项校验、剔除误检
        └── 不通过 → 收集反馈、下一轮
 ```
@@ -358,11 +365,14 @@ GET /api/v4/extract/task/{task_id}  ← 轮询任务状态直到 done/failed
 **文件**：`src/documents/parser.py`、`chunker.py`
 
 **解析器** (`parser.py`)：
-- PDF 四层 fallback：`_parse_pdf_pymupdf_raw`（嵌入式文字，毫秒级）→ `_parse_pdf_ocr`（MinerU 云 API，图片PDF首选，专用OCR）→ `_parse_pdf_vlm`（百炼 qwen-vl-ocr 视觉模型兜底）→ 返回空文档 + WARNING 日志
-- VLM 采用**两阶段分离**：`qwen-vl-ocr` 纯 OCR 提取文字（200 DPI, max_tokens=16000）→ chapterizer (DeepSeek) 结构化提取章节。各模型做各自擅长的事，避免 OCR 模型同时做 JSON 结构化导致不可靠
-- 扫描版 PDF 优先走 MinerU 专用 OCR（已配置 token），MinerU 不可用时降级为 VLM 视觉模型直接读取页面图片
+- PDF 四层 fallback：`pymupdf 嵌入式文字` → `本地 Tesseract OCR` (250 DPI, 6 线程并行) → `VLM TOC 扫描` (qwen-vl-max, 提取章节标题 + 页码) → `MinerU 云 API` (最后手段)
+- **VLM 目录提取**：单次调用 20 页 150 DPI ≈ 28K tokens，prompt 定向搜索目录页。返回 "章节标题 | 页码" 格式，自动计算各章页码范围 (第一章 p1-35, 第二章 p36-66…)
+- **两阶段分离架构**：VLM 做视觉识别（读目录），DeepSeek 做文本理解（提取章节结构），Tesseract 做正文 OCR。各模型做各自擅长的事
+- **知识处理定向 OCR**：根据章节页码范围只 OCR 该章页面（如第一章仅 35 页 ~30s），而非全量 376 页
+- **增量索引**：`vs.index_chunks` 按内容 hash 去重追加，导入新章节不删除已有数据
+- **导入状态持久化**：章节 `imported` 状态查询 ChromaDB 元数据，重启不丢失
 - 支持 TXT / MD / DOCX
-- `max_pages` 参数可限制只解析前 N 页（章节检测场景）
+- `max_pages` + `page_range` 参数灵活控制解析范围
 
 **分块器** (`chunker.py`)：
 - 策略：段落拆分 → 合并至接近 chunk_size → 超长块按句子再拆分
@@ -558,6 +568,9 @@ POST /api/chat  ←── SSE 流式回复
 | 14 | **Dual-Mode Token 监控** | `src/monitoring/` + LangSmith | 本地 SQLite + 云端 LangSmith 双轨 token 追踪 |
 | 15 | **多跳依赖执行** 🆕 | `executor.py` | 子问题按 `depends_on` 拓扑分轮，前轮结果 enrich 后轮 query | 
 | 16 | **Router 分解种子复用** 🆕 | `orchestrator.py` → `planner.py` | Router 的 decomposition 传入 Planner 做种子，避免重复分解 |
+| 17 | **图片 PDF 全链路支持** 🆕 | `parser.py` + `chapterizer.py` | VLM 目录提取+本地 OCR+页码范围定向导入，图片 PDF 章节检测→知识处理全链路打通 |
+| 18 | **VLM 快速通道** 🆕 | `chapterizer.py` | VLM pre-detected 章节跳过 LLM 检测阶段，直接 split + review |
+| 19 | **冒号归一化匹配** 🆕 | `chapterizer.py:_collapse_ws` | OCR 文本空格与 `_normalize_title` 冒号差异归一化匹配
 
 ---
 
