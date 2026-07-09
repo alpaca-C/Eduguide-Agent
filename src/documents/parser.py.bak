@@ -1,0 +1,130 @@
+﻿# Document Parser 鈥?supports PDF, TXT, DOCX, Markdown
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Document:
+    """Parsed document with metadata."""
+    filename: str
+    content: str
+    page_count: int = 0
+    metadata: dict = field(default_factory=dict)
+
+
+def parse_document(filepath: str | Path, max_pages: int | None = None) -> Document:
+    """Parse a document file, autodetecting format by extension.
+
+    Supports: .txt, .md, .pdf, .docx
+
+    Args:
+        filepath: Path to the document file.
+        max_pages: For PDFs, only parse the first N pages (None = all).
+                   Useful for chapter-detection previews where the TOC
+                   is always in the front matter.
+    """
+    filepath = Path(filepath)
+    suffix = filepath.suffix.lower()
+    
+    if suffix == ".txt":
+        return _parse_txt(filepath)
+    elif suffix == ".md":
+        return _parse_txt(filepath)  # Markdown is just text
+    elif suffix == ".pdf":
+        return _parse_pdf(filepath, max_pages=max_pages)
+    elif suffix == ".docx":
+        return _parse_docx(filepath)
+    else:
+        raise ValueError(f"Unsupported file format: {suffix}")
+
+
+def _parse_txt(filepath: Path) -> Document:
+    content = filepath.read_text(encoding="utf-8", errors="replace")
+    lines = content.splitlines()
+    return Document(
+        filename=filepath.name,
+        content=content,
+        page_count=len(lines) // 40 or 1,
+        metadata={"format": "text", "line_count": len(lines)},
+    )
+
+
+def _parse_pdf(filepath: Path, max_pages: int | None = None) -> Document:
+    """Parse PDF using pymupdf (fitz) for clean, structure-preserving text extraction.
+
+    Falls back to PyPDF2 if pymupdf is not available.
+    """
+    try:
+        import fitz
+    except ImportError:
+        logger.warning("pymupdf not available, falling back to PyPDF2")
+        return _parse_pdf_pypdf2(filepath, max_pages)
+
+    doc = fitz.open(str(filepath))
+    total = len(doc)
+    limit = min(max_pages, total) if max_pages else total
+    pages: list[str] = []
+
+    for page in doc[:limit]:
+        # get_text("text") preserves reading order better than PyPDF2
+        text = page.get_text("text")
+        if text and text.strip():
+            pages.append(text.strip())
+
+    doc.close()
+
+    content = "\n\n".join(pages)
+    return Document(
+        filename=filepath.name,
+        content=content,
+        page_count=total,
+        metadata={"format": "pdf", "pages": total, "pages_parsed": len(pages), "parser": "pymupdf"},
+    )
+
+
+def _parse_pdf_pypdf2(filepath: Path, max_pages: int | None = None) -> Document:
+    """Legacy PyPDF2 parser kept as fallback."""
+    try:
+        from PyPDF2 import PdfReader
+    except ImportError:
+        raise ImportError("PyPDF2 not installed. Run: pip install PyPDF2")
+    
+    reader = PdfReader(str(filepath))
+    total = len(reader.pages)
+    limit = min(max_pages, total) if max_pages else total
+    pages: list[str] = []
+    for page in reader.pages[:limit]:
+        text = page.extract_text()
+        if text:
+            pages.append(text)
+    
+    content = "\n\n".join(pages)
+    return Document(
+        filename=filepath.name,
+        content=content,
+        page_count=total,
+        metadata={"format": "pdf", "pages": total, "pages_parsed": len(pages), "parser": "pypdf2"},
+    )
+
+
+def _parse_docx(filepath: Path) -> Document:
+    try:
+        from docx import Document as DocxDocument
+    except ImportError:
+        raise ImportError("python-docx not installed. Run: pip install python-docx")
+    
+    doc = DocxDocument(str(filepath))
+    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    content = "\n\n".join(paragraphs)
+    return Document(
+        filename=filepath.name,
+        content=content,
+        page_count=len(paragraphs) // 30 or 1,
+        metadata={"format": "docx", "paragraph_count": len(paragraphs)},
+    )

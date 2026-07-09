@@ -1,0 +1,43 @@
+﻿.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+*.egg-info/
+dist/
+build/
+
+# Models (download separately, too large for git)
+models/
+
+# OCR binaries (install Tesseract on your system instead)
+tessdata/
+tesseract-bin/
+
+# Runtime data
+data/
+uploads/
+storage/*.db
+storage/*.db-wal
+storage/*.db-shm
+
+# Frontend build (rebuilt in CI or before deploy)
+frontend/dist/
+
+# IDE
+.idea/
+.pytest_cache/
+
+# Logs & temp
+*.log
+uvicorn_out.txt
+test_page0.png
+
+# Output
+output_report.md
+*.db
+
+# Private docs
+Agent 开发者模块 System Prompt.md
+RULE.md

@@ -1,0 +1,628 @@
+# QA Agent -- 答疑老师 + 审核老师 双角色反思流程 (RAG优先，网络兜底)
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import os
+from pathlib import Path
+
+import numpy as np
+import chromadb
+from chromadb.config import Settings
+from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+
+from ..config import Configuration
+from ..tools import get_tool_registry, get_tools_for_llm, ToolResult
+from ..tools.rag_search import init_rag_tool, get_doc_names
+from ..tools.web_search import web_search
+
+from ..prompts.qa import (SYSTEM_PROMPT, SIMPLE_CLASSIFY_PROMPT, ANSWERER_THINK_RAG_PROMPT, ANSWERER_THINK_WEB_PROMPT,
+                         ANSWERER_SYNTHESIS_PROMPT, REVIEWER_PROMPT)
+
+logger = logging.getLogger(__name__)
+
+MAX_REFLECTION_ROUNDS = 3
+LLM_MAX_RETRIES = 2       # 每次 LLM 调用最多重试次数 (共 1 + 2 = 3 次尝试)
+
+
+
+
+
+# ===========================================================================
+# Reflection Agent
+# ===========================================================================
+class ReflectionAgent:
+    """双角色 QA Agent：答疑老师(RAG优先) + 审核老师(质量把关).
+
+    Rounds 1-2: 答疑老师只用 rag_search 查教材，审核老师评判回答是否充分.
+    Round 3:   若前两轮审核不通过，答疑老师可使用 web_search 补充网络资料.
+    """
+
+    def __init__(self, config: Configuration):
+        self._config = config
+        self._llm = ChatOpenAI(
+            model=config.llm_model_id,
+            api_key=config.llm_api_key,
+            base_url=config.llm_base_url,
+            temperature=0.3,
+        )
+        self._tools = get_tool_registry()
+
+    def _get_tool_descriptions(self, allowed: set[str]) -> str:
+        """Build tool descriptions string for only the allowed tools."""
+        return "\n".join(
+            f"- **{name}**: {info['description']}"
+            for name, info in self._tools.items()
+            if name in allowed
+        )
+
+    async def _llm_retry(self, messages: list, llm=None, max_retries: int = LLM_MAX_RETRIES):
+        """Call LLM with automatic retry on transient errors.
+
+        Uses ainvoke (async) to avoid blocking the event loop.
+        """
+        llm = llm or self._llm
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await llm.ainvoke(messages)
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    delay = 1.0 * (attempt + 1)
+                    logger.warning(
+                        "LLM call failed (attempt %d/%d, retrying in %.1fs): %s",
+                        attempt + 1, max_retries + 1, delay, e,
+                    )
+                    await asyncio.sleep(delay)
+        raise last_error
+
+    def _build_think_context(self, question: str, observations: list[ToolResult], chat_history: list[dict] | None = None) -> str:
+        """Build the THINK phase context with question, existing observations, available docs, and chat history."""
+        context = f"**学生问题：** {question}\n\n"
+
+        # 注入对话历史上下文
+        if chat_history:
+            context += "对话历史：\n"
+            for msg in chat_history[-10:]:  # 只保留最近 10 条
+                role_name = "学生" if msg.get("role") == "user" else "答疑老师"
+                context += f"- {role_name}: {msg.get("content", "")[:300]}\n"
+            context += "\n"
+
+        # 注入当前已索引的教材列表
+        try:
+            doc_names = get_doc_names()
+            if doc_names:
+                context += f"**已上传教材列表（共{len(doc_names)}本）：** {', '.join(doc_names)}\n\n"
+        except Exception:
+            pass
+
+        if observations:
+            context += "**前几轮已搜索到的资料：**\n"
+            for obs in observations:
+                context += f"\n[{obs.tool_name}] {obs.content[:500]}...\n"
+
+        return context
+
+    async def answer(self, question: str, doc_filter: set[str] | None = None, chat_history: list[dict] | None = None) -> dict:
+        """Answer a question using the dual-role reflection loop.
+
+        Returns a dict with: reply, rounds, tool_calls
+
+                         chat_history: optional list of {role, content} for conversation context.
+        """
+        # ================================================================
+        # ???????? ?? ???????????????
+        # ================================================================
+        try:
+            classify_resp = await self._llm_retry([
+                SystemMessage(content=SIMPLE_CLASSIFY_PROMPT.format(question=question)),
+                HumanMessage(content="???"),
+            ])
+            classify_text = classify_resp.content.strip() if hasattr(classify_resp, "content") else str(classify_resp).strip()
+            if not classify_text.upper().startswith("NEED_SEARCH"):
+                # ????????? LLM ???
+                logger.info("Simple question detected, returning direct answer (%d chars)", len(classify_text))
+                return {
+                    "reply": classify_text,
+                    "rounds": 0,
+                    "tool_calls": [],
+                }
+        except Exception as e:
+            logger.warning("Pre-classification failed, falling through to normal flow: %s", e)
+
+        # 构建对话上下文供 SYNTHESIZE 阶段使用
+        chat_context = ""
+        if chat_history:
+            chat_context = "【对话上下文】\n"
+            for msg in chat_history[-10:]:
+                role_label = "学生" if msg.get("role") == "user" else "答疑老师"
+                chat_context += f"- {role_label}: {msg.get("content", "")[:200]}\n"
+            chat_context += "\n"
+        observations: list[ToolResult] = []
+        tool_call_log: list[dict] = []
+        last_answer = ""
+
+        for round_num in range(1, MAX_REFLECTION_ROUNDS + 1):
+            # --- 确定本轮可用工具 ---
+            if round_num <= 2:
+                allowed_tools = {"rag_search"}
+                think_template = ANSWERER_THINK_RAG_PROMPT
+            else:
+                allowed_tools = {"rag_search", "web_search"}
+                think_template = ANSWERER_THINK_WEB_PROMPT
+
+            tool_descs = self._get_tool_descriptions(allowed_tools)
+
+            # ================================================================
+            # 答疑老师: THINK — 决定搜索策略
+            # ================================================================
+            think_msg = SYSTEM_PROMPT + "\n\n" + think_template.format(tool_descriptions=tool_descs)
+            context = self._build_think_context(question, observations, chat_history)
+            messages = [SystemMessage(content=think_msg), HumanMessage(content=context)]
+
+            # 只绑定本轮允许的工具
+            tools_spec = [
+                t for t in get_tools_for_llm()
+                if t["function"]["name"] in allowed_tools
+            ]
+            llm_with_tools = self._llm.bind_tools(tools_spec) if tools_spec else self._llm
+
+            try:
+                response = await self._llm_retry(messages, llm=llm_with_tools)
+            except Exception as e:
+                logger.error("Think phase failed (round %d): %s", round_num, e)
+                try:
+                    response = await self._llm_retry(messages)
+                except Exception:
+                    break
+
+            # ================================================================
+            # 答疑老师: ACT — 执行搜索
+            # ================================================================
+            tool_calls = getattr(response, "tool_calls", []) or []
+            if not tool_calls:
+                tool_calls = self._parse_tool_calls_from_text(
+                    response.content if hasattr(response, "content") else str(response),
+                    allowed_tools,
+                )
+
+            if not tool_calls:
+                # 答疑老师没有调用工具：直接用 THINK 阶段的回答，跳过 SYNTHESIZE
+                think_answer = response.content if hasattr(response, "content") else str(response)
+                if think_answer and len(think_answer.strip()) > 10:
+                    answer = think_answer.strip()
+                    last_answer = answer
+                    logger.info("Round %d: direct answer (no tools), %d chars", round_num, len(answer))
+                else:
+                    # THINK 阶段没有给出有效回答，回退到 SYNTHESIZE
+                    logger.info("Round %d: no tool calls and no direct answer, falling back to synthesis", round_num)
+                    obs_text = "（未找到相关资料，且答疑老师未给出直接回答）"
+                    try:
+                        synth_resp = await self._llm_retry([
+                            SystemMessage(content=SYSTEM_PROMPT + "\n\n" + ANSWERER_SYNTHESIS_PROMPT.format(
+                                observations=obs_text, question=question,
+                            )),
+                            HumanMessage(content="请基于以上资料回答学生问题。"),
+                        ])
+                        answer = synth_resp.content if hasattr(synth_resp, "content") else str(synth_resp)
+                        last_answer = answer
+                    except Exception as e:
+                        logger.error("Synthesis failed (round %d): %s", round_num, e)
+                        answer = f"抱歉，回答生成失败: {e}"
+                        last_answer = answer
+            else:
+                round_results = await self._execute_tools(tool_calls, doc_filter)
+                observations.extend(round_results)
+                for tc, result in zip(tool_calls, round_results):
+                    tool_call_log.append({
+                        "round": round_num,
+                        "tool": tc.get("name", "unknown"),
+                        "query": tc.get("args", {}).get("query", ""),
+                        "result_len": len(result.content),
+                    })
+                logger.info(
+                    "Round %d: executed %d tool(s) — %s",
+                    round_num, len(round_results),
+                    ", ".join(tc.get("name", "?") for tc in tool_calls),
+                )
+
+                # ================================================================
+                # 答疑老师: SYNTHESIZE — 基于搜索结果生成回答
+                # ================================================================
+                obs_text = chat_context + "\n\n".join(
+                    f"[{o.tool_name}] {o.content}" for o in observations
+                ) if observations else "（未找到相关资料）"
+
+                try:
+                    synth_resp = await self._llm_retry([
+                        SystemMessage(content=SYSTEM_PROMPT + "\n\n" + ANSWERER_SYNTHESIS_PROMPT.format(
+                            observations=obs_text, question=question,
+                        )),
+                        HumanMessage(content="请基于以上资料回答学生问题。"),
+                    ])
+                    answer = synth_resp.content if hasattr(synth_resp, "content") else str(synth_resp)
+                    last_answer = answer
+                except Exception as e:
+                    logger.error("Synthesis failed (round %d): %s", round_num, e)
+                    answer = f"抱歉，回答生成失败: {e}"
+                    last_answer = answer
+
+
+
+            # ================================================================
+            # 审核老师: REVIEW — 判断回答是否充分（仅第1-2轮）
+            # ================================================================
+            if round_num <= 2:
+                review_obs = "\n\n".join(
+                    f"[{o.tool_name}] {o.content[:600]}" for o in observations
+                ) if observations else "（无搜索资料）"
+
+                try:
+                    review_resp = await self._llm_retry([
+                        SystemMessage(content=SYSTEM_PROMPT + "\n\n" + REVIEWER_PROMPT.format(
+                            question=question,
+                            answer=answer,
+                            observations=review_obs,
+                        )),
+                        HumanMessage(content="请判断回答是否充分。"),
+                    ])
+                    review_text = review_resp.content if hasattr(review_resp, "content") else str(review_resp)
+                    # 严格判断：只认行首的 SUFFICIENT，避免 "INSUFFICIENT: ...sufficient..." 误判
+                    if review_text.strip().upper().startswith("SUFFICIENT"):
+                        logger.info("Round %d: reviewer says SUFFICIENT, done", round_num)
+                        return {
+                            "reply": answer,
+                            "rounds": round_num,
+                            "tool_calls": tool_call_log,
+                        }
+                    else:
+                        logger.info(
+                            "Round %d: reviewer says INSUFFICIENT — %s",
+                            round_num, review_text[:120].replace("\n", " "),
+                        )
+                except Exception as e:
+                    logger.error("Review phase failed (round %d): %s", round_num, e)
+                    return {
+                        "reply": answer,
+                        "rounds": round_num,
+                        "tool_calls": tool_call_log,
+                    }
+
+        # Round 3 结束 — 返回最终回答（含网络搜索结果或尽力而为的教材回答）
+        return {
+            "reply": last_answer,
+            "rounds": MAX_REFLECTION_ROUNDS,
+            "tool_calls": tool_call_log,
+        }
+
+    def _parse_tool_calls_from_text(self, text: str, allowed: set[str]) -> list[dict]:
+        """Fallback: 正则解析 LLM 文本输出中的工具调用."""
+        tool_calls = []
+        for tool_name in sorted(allowed):
+            # 匹配格式: tool_name: "query" 或 tool_name：查询词
+            pattern = rf'{tool_name}\s*[：:]\s*["""]?\s*(.+?)\s*["""]?(?:\n|$)'
+            for match in re.finditer(pattern, text, re.MULTILINE | re.IGNORECASE):
+                query = match.group(1).strip().strip(""'""')
+                if query:
+                    tool_calls.append({
+                        "name": tool_name,
+                        "args": {"query": query},
+                        "id": f"fallback_{tool_name}_{len(tool_calls)}",
+                    })
+        return tool_calls
+
+    async def _execute_tools(
+        self, tool_calls: list[dict], doc_filter: set[str] | None
+    ) -> list[ToolResult]:
+        """并发执行多个工具调用."""
+        tasks = []
+        for tc in tool_calls:
+            name = tc.get("name", "")
+            args = tc.get("args", {})
+            query = args.get("query", "")
+
+            if name not in self._tools:
+                logger.warning("Unknown tool: %s", name)
+                continue
+
+            if name == "rag_search":
+                tasks.append(self._tools[name]["func"](
+                    query=query, filter_docs=doc_filter,
+                ))
+            else:
+                tasks.append(self._tools[name]["func"](query=query))
+
+        if not tasks:
+            return []
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out = []
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning("Tool execution failed: %s", r)
+                out.append(ToolResult(
+                    tool_name="error", query="",
+                    content=f"工具执行出错: {r}",
+                ))
+            else:
+                out.append(r)
+        return out
+
+
+# ===========================================================================
+# 全局 Agent 实例 & 向后兼容接口
+# ===========================================================================
+
+_agent: ReflectionAgent | None = None
+
+
+def get_agent(config: Configuration) -> ReflectionAgent:
+    """Get or create the ReflectionAgent singleton."""
+    global _agent
+    if _agent is None:
+        _agent = ReflectionAgent(config)
+    return _agent
+
+
+# ===========================================================================
+# Backward-compatible answer_question
+# ===========================================================================
+
+async def answer_question(
+    question: str,
+    relevant_chunks: list[str] | None = None,
+    graph_context: str = "",
+    config: Configuration | None = None,
+    chat_history: list[dict] | None = None,
+    doc_filter: set[str] | None = None,
+) -> str:
+    """Backward-compatible async function. Uses ReflectionAgent internally."""
+    if config is None:
+        raise ValueError("config is required")
+
+    agent = get_agent(config)
+    result = await agent.answer(question, doc_filter=doc_filter)
+    return result["reply"]
+
+
+# ===========================================================================
+# Custom TF-IDF embedding function for ChromaDB
+# ===========================================================================
+
+class TfidfEmbeddingFunction(EmbeddingFunction):
+    """ChromaDB embedding function using sklearn TfidfVectorizer."""
+
+    def __init__(self):
+        self._vectorizer: TfidfVectorizer | None = None
+        self._fitted = False
+
+    def fit(self, documents: list[str]):
+        self._vectorizer = TfidfVectorizer(
+            max_features=1000,
+            analyzer="char_wb",
+            ngram_range=(1, 2),
+        )
+        self._vectorizer.fit(documents)
+        self._fitted = True
+
+    def __call__(self, input: Documents) -> Embeddings:
+        if not self._fitted or self._vectorizer is None:
+            return [[0.0] * 1000 for _ in input]
+        matrix = self._vectorizer.transform(input)
+        return matrix.toarray().tolist()
+
+
+# ===========================================================================
+# ChromaDB-backed vector store
+# ===========================================================================
+
+class DocumentVectorStore:
+    """Vector store backed by ChromaDB with local TF-IDF embeddings.
+
+    Each chunk carries doc_filename metadata so search results show
+    which document a chunk came from — enabling cross-document analysis.
+
+    Incremental indexing: new chunks are appended without rebuilding the
+    entire collection. TF-IDF vocabulary is fixed after first fit to keep
+    the vector space consistent across incremental adds.
+    """
+
+    COLLECTION_NAME = "document_chunks"
+
+    def __init__(self, storage_dir: str = ""):
+        if storage_dir:
+            persist_dir = str(Path(storage_dir) / "chroma")
+        else:
+            persist_dir = str(
+                Path(__file__).resolve().parent.parent.parent / "data" / "chroma"
+            )
+        Path(persist_dir).mkdir(parents=True, exist_ok=True)
+
+        self._ef = TfidfEmbeddingFunction()
+        self._all_texts: list[str] = []
+        self._all_metas: list[dict] = []
+        self._content_hashes: set[int] = set()   # 去重：已索引内容的 hash
+        self._vocab_frozen: bool = False          # 首次 fit 后锁定词表
+        self._client = chromadb.PersistentClient(
+            path=persist_dir,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        self._ensure_collection()
+
+    def _ensure_collection(self):
+        try:
+            self._collection = self._client.get_collection(
+                name=self.COLLECTION_NAME,
+                embedding_function=self._ef,
+            )
+            # 恢复已持久化的索引状态
+            existing = self._collection.get(include=["documents", "metadatas"])
+            if existing and existing.get("documents"):
+                self._all_texts = list(existing["documents"])
+                self._all_metas = list(existing.get("metadatas", []))
+                self._content_hashes = {hash(t) for t in self._all_texts}
+                if self._all_texts:
+                    self._ef.fit(self._all_texts)
+                    self._vocab_frozen = True
+            logger.info("ChromaDB: loaded existing collection with %d chunks", len(self._all_texts))
+        except Exception:
+            self._collection = self._client.create_collection(
+                name=self.COLLECTION_NAME,
+                embedding_function=self._ef,
+                metadata={"hnsw:space": "cosine"},
+            )
+
+    def remove_document(self, doc_filename: str):
+        """Remove all chunks belonging to a specific document (incremental delete)."""
+        if not doc_filename:
+            return
+        # 从内部索引中移除
+        keep_idx = [i for i, m in enumerate(self._all_metas) if m.get("doc_filename") != doc_filename]
+        removed = len(self._all_texts) - len(keep_idx)
+        if removed == 0:
+            return
+        self._all_texts = [self._all_texts[i] for i in keep_idx]
+        self._all_metas = [self._all_metas[i] for i in keep_idx]
+        self._content_hashes = {hash(t) for t in self._all_texts}
+        # 从 ChromaDB 中移除（where 过滤，不重建索引）
+        try:
+            self._collection.delete(where={"doc_filename": doc_filename})
+        except Exception as e:
+            logger.warning("ChromaDB delete doc '%s' failed: %s", doc_filename, e)
+        logger.info("ChromaDB: removed %d chunks for '%s', %d remaining",
+                     removed, doc_filename, len(self._all_texts))
+
+    def index_chunks(self, chunks: list[dict], doc_id: str = ""):
+        """Incrementally index new chunks into ChromaDB.
+
+        - Skips chunks whose content is already indexed (by hash).
+        - Only adds truly new chunks — no collection rebuild.
+        - TF-IDF vocabulary is frozen after first fit for vector-space consistency.
+        """
+        if not chunks:
+            return
+        valid = [c for c in chunks if c.get("text", "").strip()]
+        if not valid:
+            return
+
+        # ---- 去重：按内容 hash 过滤已索引的 chunk ----
+        new_entries: list[dict] = []
+        for c in valid:
+            text = c["text"][:2000]
+            h = hash(text)
+            if h not in self._content_hashes:
+                self._content_hashes.add(h)
+                new_entries.append({**c, "text": text})
+
+        if not new_entries:
+            logger.info("ChromaDB: all %d chunks already indexed, nothing to add", len(valid))
+            return
+
+        skipped = len(valid) - len(new_entries)
+        new_texts = [c["text"] for c in new_entries]
+        new_metas = [
+            {
+                "doc_filename": c.get("doc_filename", ""),
+                "chapter_title": c.get("chapter_title", ""),
+                "chunk_index": c.get("chunk_index", 0),
+            }
+            for c in new_entries
+        ]
+
+        # ---- TF-IDF：首次 fit 后锁定词表 ----
+        self._all_texts.extend(new_texts)
+        self._all_metas.extend(new_metas)
+
+        if not self._vocab_frozen:
+            self._ef.fit(self._all_texts)
+            self._vocab_frozen = True
+            logger.info("ChromaDB: TF-IDF vocabulary frozen (%d features)",
+                         self._ef._vectorizer.get_feature_names_out().shape[0] if self._ef._vectorizer else 0)
+
+        # ---- 只为新 chunk 生成 embedding ----
+        embeddings = None
+        if self._ef._vectorizer is not None:
+            embeddings = self._ef._vectorizer.transform(new_texts).toarray().tolist()
+
+        # ---- 增量添加：只插入新 chunk，不重建 collection ----
+        existing_count = self._collection.count()
+        new_ids = [f"chunk_{existing_count + i}" for i in range(len(new_texts))]
+
+        if embeddings:
+            self._collection.add(
+                ids=new_ids, documents=new_texts,
+                metadatas=new_metas, embeddings=embeddings,
+            )
+        else:
+            self._collection.add(
+                ids=new_ids, documents=new_texts, metadatas=new_metas,
+            )
+
+        # 统计各教材的 chunk 数量
+        doc_counts: dict[str, int] = {}
+        for m in self._all_metas:
+            fn = m.get("doc_filename", "")
+            if fn:
+                doc_counts[fn] = doc_counts.get(fn, 0) + 1
+        doc_summary = ", ".join(f"{fn}({cnt}片段)" for fn, cnt in doc_counts.items())
+        logger.info(
+            "ChromaDB: +%d new chunks (skipped %d dupes), total %d across %d docs — %s",
+            len(new_ids), skipped, len(self._all_texts), len(doc_counts), doc_summary,
+        )
+
+    def search(self, query: str, top_k: int = 5, filter_docs: set[str] | None = None) -> list[dict]:
+        """Search the vector store. Returns list of {text, doc_filename, chapter_title} dicts."""
+        try:
+            where_filter = None
+            if filter_docs:
+                where_filter = {"doc_filename": {"$in": list(filter_docs)}}
+
+            if where_filter:
+                results = self._collection.query(
+                    query_texts=[query], n_results=top_k, where=where_filter
+                )
+            else:
+                results = self._collection.query(query_texts=[query], n_results=top_k)
+
+            docs = results.get("documents", [[]])[0]
+            metas = results.get("metadatas", [[]])[0]
+
+            out = []
+            for i, d in enumerate(docs):
+                if d:
+                    fn = metas[i].get("doc_filename", "") if i < len(metas) else ""
+                    ch = metas[i].get("chapter_title", "") if i < len(metas) else ""
+                    out.append({"text": d, "doc_filename": fn, "chapter_title": ch})
+            return out
+        except Exception as e:
+            logger.warning("ChromaDB search failed: %s", e)
+            return []
+
+    def get_doc_names(self) -> list[str]:
+        """Get list of indexed document names (from in-memory state, fast)."""
+        names: set[str] = set()
+        for m in self._all_metas:
+            fn = m.get("doc_filename", "")
+            if fn:
+                names.add(fn)
+        return sorted(names)
+
+    def clear(self):
+        """Clear all vector store data."""
+        try:
+            self._client.delete_collection(self.COLLECTION_NAME)
+        except Exception:
+            pass
+        self._all_texts = []
+        self._all_metas = []
+        self._content_hashes = set()
+        self._vocab_frozen = False
+        self._ensure_collection()

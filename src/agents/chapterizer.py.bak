@@ -1,0 +1,393 @@
+# 分档专家 Agent — 双角色 Reflection（检测 → 审核，最多 2 轮）
+# 从文档前 20 页中识别目录结构，提取章节名称和文本范围
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from dataclasses import dataclass
+from typing import Callable, Awaitable
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from ..config import Configuration
+from ..documents.parser import Document
+from ..prompts.chapterizer import CHAPTER_DETECTOR_PROMPT, CHAPTER_REVIEWER_PROMPT
+
+logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[str, str, int, int], Awaitable[None]] | None
+
+MAX_REFLECTION_ROUNDS = 2
+
+
+@dataclass
+class ChapterInfo:
+    """一级章节信息."""
+    title: str
+    level: int = 1
+    start_marker: str = ""
+    text: str = ""
+    text_length: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "title": self.title,
+            "level": self.level,
+            "text_preview": self.text[:200] if self.text else "",
+            "text_length": len(self.text) if self.text else 0,
+        }
+
+
+# ===========================================================================
+# ChapterizerAgent
+# ===========================================================================
+
+class ChapterizerAgent:
+    """分档专家：LLM 检测目录 → 审核，最多 2 轮 Reflection."""
+
+    def __init__(self, config: Configuration):
+        self._config = config
+        self._detect_llm: ChatOpenAI | None = None
+        self._review_llm: ChatOpenAI | None = None
+    def _get_detect_llm(self) -> ChatOpenAI:
+        """LLM for chapter detection — fast and cheap."""
+        if self._detect_llm is None:
+            model = self._config.llm_chapter_detect_model or self._config.llm_model_id
+            self._detect_llm = ChatOpenAI(
+                model=model,
+                api_key=self._config.llm_api_key,
+                base_url=self._config.llm_base_url,
+                temperature=0.0,
+                timeout=self._config.chapter_detect_timeout,
+                max_retries=1,
+                max_tokens=self._config.llm_max_tokens,
+            )
+        return self._detect_llm
+
+    def _get_review_llm(self) -> ChatOpenAI:
+        """LLM for chapter review — more capable for validation."""
+        if self._review_llm is None:
+            model = self._config.llm_chapter_review_model or self._config.llm_model_id
+            self._review_llm = ChatOpenAI(
+                model=model,
+                api_key=self._config.llm_api_key,
+                base_url=self._config.llm_base_url,
+                temperature=0.0,
+                timeout=30,
+                max_retries=1,
+                max_tokens=2000,
+            )
+        return self._review_llm
+
+    def _get_llm(self) -> ChatOpenAI:
+        """Backward-compat: use detect LLM."""
+        return self._get_detect_llm()
+    # ==================================================================
+    # Public API
+    # ==================================================================
+
+    async def detect_all(
+        self, doc: Document,
+        on_progress: ProgressCallback = None,
+    ) -> list[ChapterInfo]:
+        """检测文档一级章节，含双角色 Reflection。
+
+        从前 20 页中定位目录 → 提取章节名 → 审核，最多 2 轮，失败则报错。
+        """
+        import time as _time
+        _total_t0 = _time.time()
+        fname = doc.filename
+        logger.info("[CHAPTERIZER] ====== start detect_all for %s (%d chars) ======",
+                     fname, len(doc.content))
+
+        # ---- Reflection 循环：LLM 检测 ↔ 审核 ----
+        feedback = ""
+        for round_num in range(1, MAX_REFLECTION_ROUNDS + 1):
+            logger.info("[CHAPTERIZER] -------- reflection round %d/%d --------",
+                         round_num, MAX_REFLECTION_ROUNDS)
+            await self._report(on_progress, fname,
+                               f"检测目录中 (第{round_num}轮)...", 0, 2)
+
+            # ---- 检测专家：定位目录 → 提取章节 ----
+            _t_detect = _time.time()
+            try:
+                chapters = await asyncio.to_thread(
+                    self._llm_detect, doc, feedback
+                )
+            except Exception as e:
+                logger.warning("LLM detect round %d failed: %s", round_num, e)
+                if round_num < MAX_REFLECTION_ROUNDS:
+                    feedback = f"上一轮检测失败({e})，请重新检测"
+                    continue
+                raise RuntimeError("检测章节失败") from e
+            logger.info("[CHAPTERIZER] round %d detect: %.1fs -> %d chapters",
+                         round_num, _time.time() - _t_detect, len(chapters))
+
+            if not chapters:
+                if round_num < MAX_REFLECTION_ROUNDS:
+                    feedback = "未检测到目录结构，请仔细检查文档前 20 页的目录部分"
+                    continue
+                raise RuntimeError("检测章节失败")
+
+            # ---- 审核专家：逐项校验 ----
+            await self._report(on_progress, fname,
+                               f"审核中 (第{round_num}轮)...", 1, 2)
+            _t_review = _time.time()
+            try:
+                review = await asyncio.to_thread(
+                    self._llm_review, doc, chapters
+                )
+            except Exception as e:
+                logger.warning("LLM review round %d failed: %s", round_num, e)
+                if round_num < MAX_REFLECTION_ROUNDS:
+                    feedback = f"审核出错({e})，请重新检测"
+                    continue
+                raise RuntimeError("检测章节失败") from e
+            logger.info("[CHAPTERIZER] round %d review: %.1fs -> verdict=%s",
+                         round_num, _time.time() - _t_review, review.get("verdict"))
+
+            # ---- 应用审核结果：逐项过滤无效章节 ----
+            reviewed = review.get("chapters", [])
+            if reviewed:
+                valid_chapters = []
+                removed = []
+                for i, ch in enumerate(chapters):
+                    if i < len(reviewed) and not reviewed[i].get("valid", True):
+                        reason = reviewed[i].get("reason", "未说明")
+                        removed.append(f"'{ch.title}' ({reason})")
+                        logger.info("[CHAPTERIZER] round %d removed: '%s' — %s",
+                                     round_num, ch.title, reason)
+                    else:
+                        valid_chapters.append(ch)
+                chapters = valid_chapters
+                if removed:
+                    logger.info("[CHAPTERIZER] round %d filtered: removed %d/%d — %s",
+                                 round_num, len(removed), len(removed) + len(chapters),
+                                 "; ".join(removed[:5]))
+
+            if not chapters:
+                if round_num < MAX_REFLECTION_ROUNDS:
+                    feedback = "所有章节均被审核剔除，请重新检测真正的章节标题"
+                    continue
+                raise RuntimeError("检测章节失败")
+
+            if review.get("verdict") == "all_valid":
+                await self._report(on_progress, fname,
+                                   f"审核通过：{len(chapters)} 个章节", 2, 2)
+                logger.info("[CHAPTERIZER] ====== DONE in %.1fs, %d chapters ======",
+                             _time.time() - _total_t0, len(chapters))
+                return chapters
+
+            # 审核不通过 → 收集反馈，下一轮
+            issues = review.get("issues", [])
+            feedback = "；".join(issues) if issues else "部分章节不符合要求，请重新检测"
+            logger.info("[CHAPTERIZER] round %d feedback: %s", round_num, feedback[:200])
+
+        # 超出最大轮次 — 返回已有的章节（若有），不因少数缺失而全盘否定
+        if chapters:
+            logger.warning("[CHAPTERIZER] ====== PARTIAL after %.1fs, %d chapters (review issues unresolved) ======",
+                          _time.time() - _total_t0, len(chapters))
+            return chapters
+        logger.error("[CHAPTERIZER] ====== FAILED after %.1fs (max rounds exceeded) ======",
+                      _time.time() - _total_t0)
+        raise RuntimeError("检测章节失败")
+
+    def _llm_detect(self, doc: Document, feedback: str = "") -> list[ChapterInfo]:
+        """调用 LLM 从文档前部定位目录，提取章节名和起始标记."""
+        import time as _t
+        llm = self._get_detect_llm()
+        text = doc.content
+
+        # 目录总在前 20 页中，只取前部文本（预留足够空间覆盖长前言+完整目录）
+        sample = text[:12000]
+
+
+
+        prompt = CHAPTER_DETECTOR_PROMPT
+        user_msg = f"文档：{doc.filename}（前 20 页，共 {len(text)} 字）\n\n{sample}"
+
+        if feedback:
+            prompt += f"\n\n**上一轮审核反馈：**\n{feedback}\n请根据反馈重新检测，排除误检项。"
+
+        _t0 = _t.time()
+        resp = llm.invoke([
+            SystemMessage(content=prompt),
+            HumanMessage(content=user_msg),
+        ])
+        logger.info("Chapterizer LLM detect: %.1fs for %s", _t.time() - _t0, doc.filename)
+
+        return self._parse_chapter_response(resp, doc, text)
+
+    def _parse_chapter_response(self, resp, doc: Document, text: str) -> list[ChapterInfo]:
+        """解析 LLM 响应，提取章节列表并用 start_marker 切分文本."""
+        resp_text = resp.content if hasattr(resp, "content") else str(resp)
+        m = re.search(r'\{.*\}', resp_text, re.DOTALL)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return []
+
+        meta = data.get("chapters", [])
+        if not meta:
+            return []
+
+        for ch in meta:
+            ch["level"] = 1
+
+        return _split_by_meta(text, meta)
+
+    # ==================================================================
+    # LLM: 审核专家
+    # ==================================================================
+
+    def _llm_review(self, doc: Document, chapters: list[ChapterInfo]) -> dict:
+        """调用 LLM 审核章节列表."""
+        import time as _t
+        _t0 = _t.time()
+        llm = self._get_review_llm()
+
+        chapter_summary = []
+        for i, ch in enumerate(chapters):
+            preview = ch.text[:150].replace('\n', ' ').strip()
+            chapter_summary.append(
+                f"[{i}] 标题: {ch.title} | 长度: {ch.text_length}字\n    内容预览: {preview}..."
+            )
+
+        review_input = (
+            f"文档：{doc.filename}（{len(doc.content)}字）\n\n"
+            f"检测到的 {len(chapters)} 个章节：\n\n" +
+            "\n\n".join(chapter_summary)
+        )
+
+        resp = llm.invoke([
+            SystemMessage(content=CHAPTER_REVIEWER_PROMPT),
+            HumanMessage(content=review_input),
+        ])
+        resp_text = resp.content if hasattr(resp, "content") else str(resp)
+
+        m = re.search(r'\{.*\}', resp_text, re.DOTALL)
+        if not m:
+            return {"verdict": "all_valid", "issues": [], "chapters": []}
+        try:
+            result = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            result = {"verdict": "all_valid", "issues": [], "chapters": []}
+
+        logger.info("Chapterizer LLM review: %.1fs for %s (%d chapters, verdict=%s)",
+                     _t.time() - _t0, doc.filename, len(chapters),
+                     result.get("verdict", "?"))
+        return result
+
+    # ==================================================================
+    # Helpers
+    # ==================================================================
+
+    async def _report(self, cb, fname, stage, done, total):
+        if cb:
+            await cb(fname, stage, done, total)
+
+
+# ===========================================================================
+# Utilities
+# ===========================================================================
+
+def _normalize_title(raw: str) -> str:
+    """Clean chapter title with OCR correction."""
+    title = raw.strip()
+    if not title:
+        return title
+    title = re.sub(r"^#{1,3}\s+", "", title)
+    title = re.sub(r"\s+", " ", title)
+    title = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", title)
+    # OCR corrections for common PDF extraction errors
+    title = re.sub(r"([第十])童", r"\1章", title)   # X童 -> X章
+    title = re.sub(r"([第十])量", r"\1章", title)   # X量 -> X章
+    prefix_cn = re.match(r"^(第\s*[零〇一二三四五六七八九十百千\d]+\s*[章童篇部单元])", title)
+    if prefix_cn:
+        rest = title[prefix_cn.end():].strip()
+        clean_prefix = prefix_cn.group(1).replace("童", "章").replace("篇", "章").replace("部", "章")
+        title = clean_prefix + "：" + rest if rest else clean_prefix
+    prefix_en = re.match(r"^(Chapter\s+\d+)", title, re.IGNORECASE)
+    if prefix_en:
+        rest = title[prefix_en.end():].strip()
+        title = prefix_en.group(1) + ": " + rest if rest else prefix_en.group(1)
+    title = re.sub(r"[\s.。…\-—：:，、]+$", "", title)
+    return title.strip()
+
+def _clean(title):
+    return _normalize_title(title)
+
+def _collapse_ws(s: str) -> str:
+    """Collapse all whitespace to single spaces for fuzzy matching."""
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _split_by_meta(text: str, meta: list[dict]) -> list[ChapterInfo]:
+    """用 LLM 检测的标记拆分文档（支持空格归一化 + OCR 纠错匹配）."""
+    norm_text = _collapse_ws(text)
+    positions = []
+    for ch in meta:
+        marker = ch.get("start_marker", "").strip()
+        title = ch.get("title", "").strip()
+        pos = -1
+        # 1) Exact match
+        for cand in [marker, title]:
+            if cand:
+                pos = text.find(cand)
+                if pos >= 0:
+                    break
+        # 2) Collapsed-whitespace match ("第一章 复数" vs "第一章复数")
+        if pos < 0:
+            for cand in [marker, title]:
+                norm_cand = _collapse_ws(cand)
+                if norm_cand and len(norm_cand) >= 6:
+                    norm_pos = norm_text.find(norm_cand)
+                    if norm_pos >= 0:
+                        prefix = norm_cand.split()[0] if norm_cand.split() else norm_cand[:4]
+                        pos = text.find(prefix)
+                        break
+        # 3) Chapter prefix fallback with OCR correction ("第十童" → "第十章")
+        if pos < 0:
+            prefix_match = re.match(r'^(第[零〇一二三四五六七八九十百千\d]+)([章童篇])|^(Chapter\s+\d+)', title)
+            if prefix_match:
+                prefix = prefix_match.group(1) or prefix_match.group(3) or ''
+                marker_char = prefix_match.group(2) or ''
+                if marker_char:
+                    prefix = prefix + '章'  # normalize 童/篇 → 章
+                pos = text.find(prefix)
+        positions.append((pos if pos >= 0 else 999999, title, marker))
+
+    positions.sort(key=lambda x: x[0])
+    seen, filtered = set(), []
+    for pos, title, marker in positions:
+        if pos < 999999 and pos not in seen:
+            seen.add(pos)
+            filtered.append((pos, title, marker))
+
+    chapters = []
+    for i, (pos, title, marker) in enumerate(filtered):
+        next_positions = [p for p, _, _ in filtered[i + 1:] if p > pos]
+        end = min(next_positions) if next_positions else len(text)
+        ch_text = text[pos:end].strip()
+        if not ch_text or len(ch_text) < 20:
+            continue
+        chapters.append(ChapterInfo(
+            title=_normalize_title(title) or f"章节{i + 1}",
+            level=1,
+            start_marker=marker,
+            text=ch_text,
+            text_length=len(ch_text),
+        ))
+    return [c for c in chapters if c.text] or []
+
+
+# Backward-compat
+def detect_chapters(doc: Document, config: Configuration) -> list[ChapterInfo]:
+    agent = ChapterizerAgent(config)
+    return asyncio.run(agent.detect_all(doc))
