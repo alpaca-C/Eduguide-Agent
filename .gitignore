@@ -25,8 +25,9 @@ storage/*.db-shm
 # Frontend build (rebuilt in CI or before deploy)
 frontend/dist/
 
-# IDE
+# IDE & Tools
 .idea/
+.claude/
 .pytest_cache/
 
 # Logs & temp
