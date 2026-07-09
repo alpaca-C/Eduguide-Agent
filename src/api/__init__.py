@@ -59,11 +59,17 @@ except Exception as e:
     logger.debug("Monitoring router not available, skipping: %s", e)
 
 # ── Static files (frontend) ─────────────────────────────────────────────
+from starlette.staticfiles import StaticFiles as _StaticFiles
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-# Prefer the Vue 3 Vite build output; fall back to the raw frontend dir
 dist_dir = PROJECT_ROOT / "frontend" / "dist"
 frontend_dir = PROJECT_ROOT / "frontend"
-if dist_dir.exists():
-    app.mount("/", StaticFiles(directory=str(dist_dir), html=True), name="frontend")
-elif frontend_dir.exists():
-    app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
+_static_dir = dist_dir if dist_dir.exists() else frontend_dir
+
+if _static_dir.exists():
+    # Mount with html=True for SPA fallback. Cache for 1 hour on assets
+    # (they have content hashes) but not on index.html.
+    app.mount(
+        "/",
+        _StaticFiles(directory=str(_static_dir), html=True),
+        name="frontend",
+    )

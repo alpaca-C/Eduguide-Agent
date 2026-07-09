@@ -19,7 +19,7 @@ from src.agents.extractor import extract_full_document
 from src.agents.chapterizer import _split_by_meta
 
 from .schemas import ProcessRequest
-from .deps import kg, vs, chapters_cache, UPLOAD_DIR, uploaded_files
+from .deps import kg, vs, chapters_cache, UPLOAD_DIR, uploaded_files, _load_chapters
 
 logger = logging.getLogger(__name__)
 
@@ -91,19 +91,28 @@ async def process_knowledge(req: ProcessRequest):
             })
             await asyncio.sleep(0.1)
 
-            # Resolve page range for targeted OCR (image PDF chapters)
+            # Resolve page range (required for image PDF targeted OCR).
             _page_range: tuple[int, int] | None = None
             if chap_infos:
                 _ci = chap_infos[0]
                 _info = chapters_cache.get(_ci["label"], {})
                 _sp = _info.get("start_page", 0)
                 _ep = _info.get("end_page", 0)
-                logger.info(
-                    "[knowledge] chapter=%s start_page=%s end_page=%s",
-                    _ci["label"], _sp, _ep,
-                )
+                if _sp <= 0 or _ep <= 0:
+                    _saved = _load_chapters(fname)
+                    for _sc in _saved:
+                        if _sc.get("title") == _ci.get("title"):
+                            _sp = _sc.get("start_page", 0)
+                            _ep = _sc.get("end_page", 0)
+                            break
                 if _sp > 0 and _ep > 0 and _ep >= _sp:
                     _page_range = (_sp, _ep)
+                else:
+                    yield _sse({
+                        "type": "error",
+                        "msg": f"缺少章节页码信息，请重新检测章节后再处理: {_ci['title']}",
+                    })
+                    return
 
             full_doc = await asyncio.to_thread(
                 parse_document, full_path, page_range=_page_range,
@@ -202,7 +211,6 @@ async def process_knowledge(req: ProcessRequest):
         await asyncio.sleep(0.1)
 
         # ── Step 3: Index ──
-        vs.clear()
         chunk_dicts = [
             {
                 "chunk_id": c.chunk_id, "text": c.text,
@@ -333,9 +341,5 @@ async def get_stats():
 
 @router.get("/documents")
 async def list_documents():
-    """List indexed document names for filtering. Clears stale data if no files."""
-    from .deps import uploaded_files as uf
-    if not uf:
-        kg.clear()
-        return {"documents": []}
+    """List indexed document names from the knowledge graph."""
     return {"documents": kg.get_doc_names()}

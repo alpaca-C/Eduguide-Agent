@@ -104,9 +104,9 @@ export const useDocsStore = defineStore('docs', () => {
         label: c.label,
         filename: c.filename || filename,
         text_length: c.text_length || 0,
+        imported: c.imported || false,
         selected: false,
       }))
-      // Mark hasCache in detection state
       const s = _ensureState(filename)
       s.hasCache = true
       return true
@@ -120,6 +120,7 @@ export const useDocsStore = defineStore('docs', () => {
           label: c.label,
           filename: c.filename || filename,
           text_length: c.text_length || 0,
+          imported: c.imported || false,
           selected: false,
         }))
         docChaptersCache.value[filename] = { chapters: data.chapters }
@@ -153,16 +154,12 @@ export const useDocsStore = defineStore('docs', () => {
     const fn = filename || activeDoc.value
     if (!fn) return
     try {
-      const data = await get('/knowledge/documents')
-      const docs = data.documents || []
-      if (docs.some(d => d.includes(fn))) {
-        // Document is imported — mark all its chapters as processed.
-        // Load chapters if not already cached, then use their labels.
-        if (!processedLabels.value[fn]?.length) {
-          await loadChapters(fn)
-          processedLabels.value[fn] = chapters.value.map(c => c.label)
-        }
-      }
+      // Always query backend directly for fresh imported status
+      const data = await get(`/chapters/${encodeURIComponent(fn)}`)
+      const importedLabels = (data.chapters || [])
+        .filter(c => c.imported)
+        .map(c => c.label)
+      processedLabels.value[fn] = importedLabels
     } catch { /* keep existing */ }
   }
 

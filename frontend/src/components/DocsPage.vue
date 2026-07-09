@@ -66,6 +66,7 @@ async function selectDoc(filename) {
   if (docs.activeDoc === filename) return
   docs.activeDoc = filename
   await docs.loadChapters(filename)
+  await docs.loadProcessedLabels()
 }
 
 async function deleteFile(filename) {

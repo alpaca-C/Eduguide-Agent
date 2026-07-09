@@ -23,7 +23,7 @@ from src.agents.chapterizer import _split_by_meta
 from .schemas import ChapterDetectRequest, SaveChaptersRequest
 from .deps import (
     chapter_agent, chapters_cache, uploaded_files,
-    _save_chapters, _load_chapters, kg,
+    _save_chapters, _load_chapters, kg, vs,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,8 +115,8 @@ async def _detect_one_file_impl(
         vlm_ranges: dict[str, dict] = {}
         for _r in (preview_doc.metadata.get("vlm_chapter_ranges") or []):
             vlm_ranges[_r["title"]] = _r
-        # Check which documents already have imported data
-        _imported_docs = set(kg.get_doc_names())
+        # Check which chapters already have chunks in vector store
+        _imported_chapters = vs.get_imported_chapter_titles(fname) if vs else set()
         chapter_list = []
         for ch in preview_chapters:
             label = f"[{fname}] {ch.title}"
@@ -131,7 +131,10 @@ async def _detect_one_file_impl(
                 "text_length": len(ch.text) if ch.text else 0,
                 "start_page": _range.get("start_page", 0) if _range else 0,
                 "end_page": _range.get("end_page", 0) if _range else 0,
-                "imported": fname in _imported_docs,
+                "imported": ch.title.replace("：", "").replace(":", "").replace(" ", "") in {
+                    t.replace("：", "").replace(":", "").replace(" ", "")
+                    for t in _imported_chapters
+                },
             })
             chapters_cache[label] = {
                 "filename": fname,
@@ -287,7 +290,11 @@ async def save_chapters(req: SaveChaptersRequest):
 async def get_chapters(filename: str):
     """Get cached chapters for a file."""
     chapters = _load_chapters(filename)
-    _imported_docs = set(kg.get_doc_names())
+    _imported_chapters = vs.get_imported_chapter_titles(filename) if vs else set()
     for ch in chapters:
-        ch["imported"] = filename in _imported_docs
+        _t = ch.get("title", "").replace("：", "").replace(":", "").replace(" ", "")
+        ch["imported"] = _t in {
+            t.replace("：", "").replace(":", "").replace(" ", "")
+            for t in _imported_chapters
+        }
     return {"chapters": chapters}

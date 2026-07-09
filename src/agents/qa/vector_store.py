@@ -189,6 +189,35 @@ class DocumentVectorStore:
                      removed, doc_filename, chapter_title, len(self._all_texts))
         return removed
 
+    def get_imported_chapter_titles(self, doc_filename: str) -> set[str]:
+        """Return chapter titles that have chunks in the vector store."""
+        try:
+            results = self._collection.get(
+                where={"doc_filename": doc_filename},
+                include=["metadatas"],
+            )
+            titles = set()
+            for m in (results.get("metadatas") or []):
+                t = (m or {}).get("chapter_title", "")
+                if t:
+                    titles.add(t)
+            logger.info(
+                "VS.get_imported_chapter_titles(%s): %d metas → %d titles: %s",
+                doc_filename, len(results.get("metadatas") or []),
+                len(titles), list(titles)[:5],
+            )
+            return titles
+        except Exception as _e:
+            logger.warning("VS.get_imported_chapter_titles failed: %s", _e)
+            return set()
+
+    def has_document(self, doc_filename: str) -> bool:
+        """Check if any chunks exist for this document."""
+        return any(
+            m.get("doc_filename") == doc_filename
+            for m in self._all_metas
+        )
+
     def index_chunks(self, chunks: list[dict], doc_id: str = ""):
         if not chunks:
             return

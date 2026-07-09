@@ -31,7 +31,12 @@
       "Bash(cp \"C:/Program Files/Tesseract-OCR/\"*.dll \"D:/NOTHING/self-coding/research-agent/tesseract-bin/\")",
       "Bash(\"D:/NOTHING/self-coding/research-agent/tesseract-bin/tesseract.exe\" --list-langs)",
       "Bash(\"D:/NOTHING/self-coding/research-agent/tesseract-bin/tesseract.exe\" --tessdata-dir \"D:/NOTHING/self-coding/research-agent/tessdata\" --list-langs)",
-      "Bash(D:/NOTHING/self-coding/research-agent/.venv/Scripts/python.exe *)"
+      "Bash(D:/NOTHING/self-coding/research-agent/.venv/Scripts/python.exe *)",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(git checkout *)",
+      "Bash(git merge *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
     ]
   }
 }
