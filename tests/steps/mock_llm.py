@@ -1,7 +1,7 @@
 # Mock LLM responses for BDD testing (zero API cost)
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
 # Canned responses matching the extractor's JSON format
@@ -51,8 +51,12 @@ class MockLLMResponse:
 
 
 def create_mock_llm(response_content: str = EXTRACTION_RESPONSE):
-    """Create a mock ChatOpenAI that returns a canned response."""
+    """Create a mock ChatOpenAI with canned async response."""
+    async def _fake_ainvoke(*_args, **_kwargs):
+        return MockLLMResponse(response_content)
+
     mock = MagicMock()
+    mock.ainvoke = AsyncMock(side_effect=_fake_ainvoke)
     mock.invoke.return_value = MockLLMResponse(response_content)
     return mock
 

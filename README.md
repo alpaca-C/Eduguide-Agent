@@ -1,8 +1,11 @@
 # Document QA System — 项目介绍
 
+[![CI](https://github.com/alpaca-C/Eduguide-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/alpaca-C/Eduguide-Agent/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/alpaca-C/Eduguide-Agent/branch/main/graph/badge.svg)](https://codecov.io/gh/alpaca-C/Eduguide-Agent)
+
 > 基于 LLM 的文档知识图谱问答系统。用户上传教材/论文/笔记，系统自动检测章节结构、构建向量索引和知识图谱，支持基于资料的自然语言问答。
 >
-> 最后更新：2026-07-09（图片PDF章节检测全链路修复：VLM目录提取+本地OCR+页码范围定向导入+增量索引入库）
+> 最后更新：2026-07-10（工程化基础：CI/CD + 集成测试 + 测试覆盖率 + 代码规范工具）
 
 ---
 
@@ -17,8 +20,8 @@
 ### 1. 克隆并进入项目
 
 ```bash
-git clone https://github.com/your-username/research-agent.git
-cd research-agent
+git clone https://github.com/alpaca-C/Eduguide-Agent.git
+cd Eduguide-Agent
 ```
 
 ### 2. 配置环境变量
@@ -116,7 +119,7 @@ cd frontend && npm run dev    # Vite 热重载，端口 5173
 | 网络搜索 | Tavily API |
 | Token 监控 | LangChain Callback + SQLite |
 | 前端 | Vue 3 + Vite + Pinia + Vue Router + marked.js + KaTeX |
-| 测试 | pytest (unit) + Behave (BDD) + MagicMock |
+| 测试 | pytest (unit + integration) + pytest-cov + Behave (BDD) + MagicMock |
 
 ---
 

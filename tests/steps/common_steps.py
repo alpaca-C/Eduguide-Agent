@@ -4,7 +4,7 @@
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from behave import given, when, then
 from behave.runner import Context
@@ -50,9 +50,14 @@ class MockLLMResponse:
 
 
 def mock_llm_factory(response_content: str):
-    """Factory that returns a mock ChatOpenAI with canned response."""
+    """Factory that returns a mock ChatOpenAI with canned async response."""
     def _make(*args, **kwargs):
+        async def _fake_ainvoke(*_args, **_kwargs):
+            return MockLLMResponse(response_content)
+
         mock = MagicMock()
+        mock.ainvoke = AsyncMock(side_effect=_fake_ainvoke)
+        # Keep sync invoke for backward compat
         mock.invoke.return_value = MockLLMResponse(response_content)
         return mock
     return _make

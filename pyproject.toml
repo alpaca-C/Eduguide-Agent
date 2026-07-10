@@ -1,0 +1,46 @@
+[tool.pytest.ini_options]
+# ── Pytest defaults ─────────────────────────────────────────────
+testpaths = ["tests/unit", "tests/integration"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+# ── Coverage: which source to measure ───────────────────────────
+source = ["src"]
+omit = [
+    "src/__init__.py",
+    "src/agents/__init__.py",
+    "src/api/__init__.py",
+    "src/documents/__init__.py",
+    "src/knowledge/__init__.py",
+    "src/memory/__init__.py",
+    "src/monitoring/__init__.py",
+    "src/prompts/__init__.py",
+    "src/tools/__init__.py",
+]
+
+[tool.coverage.report]
+# ── Coverage: terminal + HTML output ────────────────────────────
+fail_under = 25
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "class .*\\bProtocol\\):",
+]
+
+[tool.ruff]
+# ── Ruff lint: informational only (not enforced in CI) ─────────
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes (unused imports, undefined names, etc.)
+    "W",      # pycodestyle warnings
+    "I",      # isort (import ordering)
+]
+ignore = [
+    "E501",   # line too long — handled by line-length setting
+]
