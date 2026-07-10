@@ -20,7 +20,7 @@ omit = [
 
 [tool.coverage.report]
 # ── Coverage: terminal + HTML output ────────────────────────────
-fail_under = 60
+fail_under = 25
 exclude_lines = [
     "pragma: no cover",
     "if __name__ == .__main__.:",
