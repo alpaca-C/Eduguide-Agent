@@ -164,11 +164,17 @@ def init_context(
     logger.info("RAGRetrievalSkill: Dense+CE (default) / Dense+Sparse+Graph+CE (full) ready")
 
     # Build QASystem → wrap in ProblemSolveSkill → build Supervisor
-    from .agents.qa.orchestrator import QASystem
-    qa_system = QASystem(config, gssc_pipeline=ctx.gssc_pipeline, rag_skill=ctx.rag_skill)
-    problem_solve = ProblemSolveSkill(qa_system)
-    ctx.supervisor = Supervisor(ctx.memory_manager, {"problem_solve": problem_solve})
-    logger.info("Supervisor: ready (1 skill registered: problem_solve)")
+    # Wrapped in try-except so network issues during ChatOpenAI init
+    # don't block the app from starting (health check still works).
+    try:
+        from .agents.qa.orchestrator import QASystem
+        qa_system = QASystem(config, gssc_pipeline=ctx.gssc_pipeline, rag_skill=ctx.rag_skill)
+        problem_solve = ProblemSolveSkill(qa_system)
+        ctx.supervisor = Supervisor(ctx.memory_manager, {"problem_solve": problem_solve})
+        logger.info("Supervisor: ready (1 skill registered: problem_solve)")
+    except Exception as e:
+        logger.error("Supervisor init failed (QA will be unavailable): %s", e)
+        ctx.supervisor = None
 
     # Update RAG tool with MemoryManager (enables unified recall path)
     init_rag_tool(memory_manager=ctx.memory_manager)

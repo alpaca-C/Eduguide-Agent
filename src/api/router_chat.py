@@ -28,6 +28,9 @@ async def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())[:12]
     filter_docs = set(req.doc_filter) if req.doc_filter else set()
 
+    if supervisor is None:
+        raise HTTPException(503, "QA service not initialized")
+
     # Save user message
     try:
         supervisor._memory.short_term.add_message(session_id, "user", req.question)

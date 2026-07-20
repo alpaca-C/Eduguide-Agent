@@ -220,16 +220,28 @@ async def _candidates_to_result(
 
     # Source 1: Dense (always — primary source)
     if vs is not None:
+        dense_results = []
         try:
-            dense = vs._search_dense(query, top_k=20, filter_docs=filter_docs) or []
-            for r in dense:
-                cid = r.get("chunk_id", "")
-                if cid and cid not in seen_ids:
-                    seen_ids.add(cid)
-                    r["source"] = "dense"
-                    candidates.append(r)
-        except Exception as e:
-            logger.warning("Dense search failed: %s", e)
+            if hasattr(vs, '_search_dense'):
+                dense_results = vs._search_dense(query, top_k=20, filter_docs=filter_docs) or []
+        except Exception:
+            pass
+        # Fallback: use search_hybrid or search (backward compat with tests)
+        if not dense_results:
+            try:
+                if hasattr(vs, 'search_hybrid'):
+                    hybrid = vs.search_hybrid(query, top_k=top_k * 2, filter_docs=filter_docs)
+                    dense_results = hybrid.get("dense", [])
+                elif hasattr(vs, 'search'):
+                    dense_results = vs.search(query, top_k=top_k * 2, filter_docs=filter_docs) or []
+            except Exception as e:
+                logger.warning("Dense search fallback failed: %s", e)
+        for r in dense_results:
+            cid = r.get("chunk_id", "")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                r["source"] = r.get("source", "dense")
+                candidates.append(r)
 
     if full:
         # Source 2: Sparse (supplement — keyword precision)
