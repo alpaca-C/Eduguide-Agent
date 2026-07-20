@@ -10,7 +10,14 @@ Provides:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+import os
+
+# ── Prevent module-level network calls during test collection ───────────────
+# context.py calls init_context() at import time, which creates ChatOpenAI.
+# In CI, this triggers real HTTP connections. Mock it before any imports.
+os.environ.setdefault("LLM_API_KEY", "test-mock-key")
+os.environ.setdefault("LLM_BASE_URL", "http://127.0.0.1:1")
 
 from pathlib import Path
 

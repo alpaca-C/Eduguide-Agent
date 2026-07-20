@@ -122,8 +122,14 @@ def init_context(
     )
 
     # Eager-init light objects
-    from .agents.chapterizer import ChapterizerAgent
-    ctx.chapter_agent = ChapterizerAgent(config)
+    # Wrapped in try-except: ChapterizerAgent creates ChatOpenAI which may
+    # fail in CI environments without network access.
+    try:
+        from .agents.chapterizer import ChapterizerAgent
+        ctx.chapter_agent = ChapterizerAgent(config)
+    except Exception as e:
+        logger.warning("ChapterizerAgent init failed (chapter detection unavailable): %s", e)
+        ctx.chapter_agent = None
 
     from .agents.qa import DocumentVectorStore
     ctx.vector_store = DocumentVectorStore()
