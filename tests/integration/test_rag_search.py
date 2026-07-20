@@ -86,20 +86,24 @@ class TestRAGSearchIntegration:
         # Store originals for cleanup
         orig_vs = rs._vector_store
         orig_kg = rs._knowledge_graph
+        orig_mm = rs._memory_manager
         rs._vector_store = mock_vs
         rs._knowledge_graph = mock_kg
-        return orig_vs, orig_kg
+        rs._memory_manager = None  # Bypass manager path, use globals directly
+        return orig_vs, orig_kg, orig_mm
 
-    def _teardown_mock_backends(self, orig_vs, orig_kg):
+    def _teardown_mock_backends(self, state):
         """Restore original backends."""
+        orig_vs, orig_kg, orig_mm = state
         import src.tools.rag_search as rs
         rs._vector_store = orig_vs
         rs._knowledge_graph = orig_kg
+        rs._memory_manager = orig_mm
 
     @pytest.mark.asyncio
     async def test_default_search_uses_dense_with_ce(self):
         """Default rag_search: Dense + Cross-Encoder only (no sparse/graph)."""
-        orig_vs, orig_kg = self._setup_mock_backends()
+        state = self._setup_mock_backends()  # (orig_vs, orig_kg, orig_mm)
         try:
             from src.tools.rag_search import rag_search
 
@@ -111,12 +115,12 @@ class TestRAGSearchIntegration:
             assert result.metadata["chunks_found"] > 0
             assert result.metadata["ce_reranked"] is True
         finally:
-            self._teardown_mock_backends(orig_vs, orig_kg)
+            self._teardown_mock_backends(state)
 
     @pytest.mark.asyncio
     async def test_fullsearch_includes_graph_and_sparse(self):
         """rag_fullsearch: Dense + Sparse + Graph + Cross-Encoder."""
-        orig_vs, orig_kg = self._setup_mock_backends()
+        state = self._setup_mock_backends()  # (orig_vs, orig_kg, orig_mm)
         try:
             from src.tools.rag_search import rag_fullsearch
 
@@ -129,7 +133,7 @@ class TestRAGSearchIntegration:
             assert result.metadata["chunks_found"] > 0
             assert result.metadata["concepts_found"] >= 1
         finally:
-            self._teardown_mock_backends(orig_vs, orig_kg)
+            self._teardown_mock_backends(state)
 
     @pytest.mark.asyncio
     async def test_rrf_dedup_removes_duplicates(self):

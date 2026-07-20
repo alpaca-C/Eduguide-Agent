@@ -41,21 +41,16 @@ def _setup_mock_backends():
     """Wire mock vector store + knowledge graph into the rag_search module."""
     import src.tools.rag_search as rs
 
+    chunk = {"chunk_id": "chunk_1", "text": "库仑定律：F=k·q₁q₂/r²",
+             "doc_filename": "电磁学.pdf", "chapter_title": "第一章 静电场", "source": "dense"}
+    chunk2 = {"chunk_id": "chunk_2", "text": "库仑定律 1785 年由库仑通过扭秤实验得出。",
+              "doc_filename": "电磁学.pdf", "chapter_title": "第一章 静电场", "source": "sparse"}
+
     mock_vs = MagicMock()
-    mock_vs.search_hybrid.return_value = {
-        "dense": [
-            {"text": "库仑定律：F=k·q₁q₂/r²",
-             "doc_filename": "电磁学.pdf", "chapter_title": "第一章 静电场", "source": "dense"},
-        ],
-        "sparse": [
-            {"text": "库仑定律 1785 年由库仑通过扭秤实验得出。",
-             "doc_filename": "电磁学.pdf", "chapter_title": "第一章 静电场", "source": "sparse"},
-        ],
-    }
-    mock_vs.search.return_value = [
-        {"text": "库仑定律：F=k·q₁q₂/r²",
-         "doc_filename": "电磁学.pdf", "chapter_title": "第一章 静电场", "source": "dense"},
-    ]
+    mock_vs.search_hybrid.return_value = {"dense": [chunk], "sparse": [chunk2]}
+    mock_vs.search.return_value = [chunk]
+    mock_vs._search_dense.return_value = [chunk]
+    mock_vs._search_sparse.return_value = [chunk2]
     mock_vs.get_doc_names.return_value = ["电磁学.pdf"]
 
     mock_kg = MagicMock()
@@ -68,6 +63,7 @@ def _setup_mock_backends():
     orig_kg = rs._knowledge_graph
     rs._vector_store = mock_vs
     rs._knowledge_graph = mock_kg
+    rs._memory_manager = None  # Bypass manager path, use globals directly
     return orig_vs, orig_kg
 
 
