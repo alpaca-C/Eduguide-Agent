@@ -53,6 +53,7 @@ class TestRAGSearchIntegration:
         import src.tools.rag_search as rs
 
         mock_vs = MagicMock()
+        # search_hybrid + search (legacy compat)
         mock_vs.search_hybrid.side_effect = (
             lambda query, top_k=5, filter_docs=None: {
                 "dense": _mock_vs_dense(query, top_k, filter_docs),
@@ -62,6 +63,15 @@ class TestRAGSearchIntegration:
         mock_vs.search.side_effect = (
             lambda query, top_k=5, filter_docs=None:
                 _mock_vs_dense(query, top_k, filter_docs)
+        )
+        # _search_dense + _search_sparse (new code calls these directly)
+        mock_vs._search_dense.side_effect = (
+            lambda query, top_k=20, filter_docs=None:
+                _mock_vs_dense(query, top_k, filter_docs)
+        )
+        mock_vs._search_sparse.side_effect = (
+            lambda query, top_k=10, filter_docs=None:
+                _mock_vs_sparse(query, top_k, filter_docs)
         )
         mock_vs.get_doc_names.return_value = ["电磁学.pdf", "量子力学.pdf"]
 
