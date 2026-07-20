@@ -13,10 +13,11 @@ from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 # ── Module-level: prevent ChatOpenAI from making real network calls ─────────
-# Applied at import time so any code that creates ChatOpenAI during test
-# collection/execution gets a mock instead of a real network connection.
+async def _mock_ainvoke(*a, **kw):
+    return MagicMock(content="mock")
+
 _mock_llm = MagicMock()
-_mock_llm.return_value.ainvoke = MagicMock(return_value=MagicMock(content="mock"))
+_mock_llm.return_value.ainvoke = _mock_ainvoke
 _patcher = patch("langchain_openai.ChatOpenAI", _mock_llm)
 try:
     _patcher.start()
