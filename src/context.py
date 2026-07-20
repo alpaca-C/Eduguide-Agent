@@ -121,14 +121,17 @@ def init_context(
         knowledge_graph=kg,
     )
 
-    # Eager-init light objects
-    # Wrapped in try-except: ChapterizerAgent creates ChatOpenAI which may
-    # fail in CI environments without network access.
-    try:
-        from .agents.chapterizer import ChapterizerAgent
-        ctx.chapter_agent = ChapterizerAgent(config)
-    except Exception as e:
-        logger.warning("ChapterizerAgent init failed (chapter detection unavailable): %s", e)
+    # Eager-init light objects — skip in CI to avoid network calls
+    _in_ci = _os.environ.get("CI", "") or os.environ.get("GITHUB_ACTIONS", "")
+    if not _in_ci:
+        try:
+            from .agents.chapterizer import ChapterizerAgent
+            ctx.chapter_agent = ChapterizerAgent(config)
+        except Exception as e:
+            logger.warning("ChapterizerAgent init failed: %s", e)
+            ctx.chapter_agent = None
+    else:
+        logger.info("CI environment detected, skipping ChapterizerAgent init")
         ctx.chapter_agent = None
 
     from .agents.qa import DocumentVectorStore
@@ -170,16 +173,19 @@ def init_context(
     logger.info("RAGRetrievalSkill: Dense+CE (default) / Dense+Sparse+Graph+CE (full) ready")
 
     # Build QASystem → wrap in ProblemSolveSkill → build Supervisor
-    # Wrapped in try-except so network issues during ChatOpenAI init
-    # don't block the app from starting (health check still works).
-    try:
-        from .agents.qa.orchestrator import QASystem
-        qa_system = QASystem(config, gssc_pipeline=ctx.gssc_pipeline, rag_skill=ctx.rag_skill)
-        problem_solve = ProblemSolveSkill(qa_system)
-        ctx.supervisor = Supervisor(ctx.memory_manager, {"problem_solve": problem_solve})
-        logger.info("Supervisor: ready (1 skill registered: problem_solve)")
-    except Exception as e:
-        logger.error("Supervisor init failed (QA will be unavailable): %s", e)
+    # Skip in CI: tests mock their own QASystem instances
+    if not _in_ci:
+        try:
+            from .agents.qa.orchestrator import QASystem
+            qa_system = QASystem(config, gssc_pipeline=ctx.gssc_pipeline, rag_skill=ctx.rag_skill)
+            problem_solve = ProblemSolveSkill(qa_system)
+            ctx.supervisor = Supervisor(ctx.memory_manager, {"problem_solve": problem_solve})
+            logger.info("Supervisor: ready (1 skill registered: problem_solve)")
+        except Exception as e:
+            logger.error("Supervisor init failed (QA will be unavailable): %s", e)
+            ctx.supervisor = None
+    else:
+        logger.info("CI environment, skipping Supervisor init (tests mock it)")
         ctx.supervisor = None
 
     # Update RAG tool with MemoryManager (enables unified recall path)
