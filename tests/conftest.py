@@ -172,7 +172,8 @@ def mock_config(monkeypatch):
 
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     monkeypatch.setenv("LLM_MODEL_ID", "test-model")
-    monkeypatch.setenv("LLM_BASE_URL", "https://test.api.example.com")
+    # Use localhost to prevent real network calls during test collection
+    monkeypatch.setenv("LLM_BASE_URL", "http://127.0.0.1:1")
     monkeypatch.setenv("EMBEDDING_MODEL_PATH", "test/embedding")
     monkeypatch.setenv("MONITORING_ENABLED", "false")
     monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
