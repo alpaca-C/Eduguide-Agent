@@ -122,7 +122,7 @@ def init_context(
     )
 
     # Eager-init light objects — skip in CI to avoid network calls
-    _in_ci = _os.environ.get("CI", "") or os.environ.get("GITHUB_ACTIONS", "")
+    _in_ci = _os.environ.get("CI", "") or _os.environ.get("GITHUB_ACTIONS", "")
     if not _in_ci:
         try:
             from .agents.chapterizer import ChapterizerAgent
