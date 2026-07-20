@@ -10,19 +10,7 @@ Provides:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from unittest.mock import MagicMock, patch
-
-# ── Module-level: prevent ChatOpenAI from making real network calls ─────────
-async def _mock_ainvoke(*a, **kw):
-    return MagicMock(content="mock")
-
-_mock_llm = MagicMock()
-_mock_llm.return_value.ainvoke = _mock_ainvoke
-_patcher = patch("langchain_openai.ChatOpenAI", _mock_llm)
-try:
-    _patcher.start()
-except Exception:
-    pass  # langchain_openai may not be installed in all test environments
+from unittest.mock import MagicMock
 
 from pathlib import Path
 
