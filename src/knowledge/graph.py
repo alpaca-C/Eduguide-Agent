@@ -19,7 +19,8 @@ class ConceptNode:
     name: str
     description: str
     category: str = ""          # e.g. "definition", "theorem", "method", "example"
-    source_chunk_id: str = ""   # Which document chunk this came from
+    source_chunk_id: str = ""   # Primary chunk (where concept was first defined)
+    related_chunk_ids: str = ""    # Comma-separated chunk IDs where concept is also discussed
     doc_filename: str = ""
     metadata: dict = field(default_factory=dict)
 
@@ -30,6 +31,7 @@ class ConceptNode:
             "description": self.description,
             "category": self.category,
             "source_chunk_id": self.source_chunk_id,
+            "related_chunk_ids": self.related_chunk_ids,
             "doc_filename": self.doc_filename,
             "metadata": self.metadata,
         }
@@ -79,6 +81,7 @@ class KnowledgeGraph:
                     description TEXT NOT NULL,
                     category TEXT DEFAULT '',
                     source_chunk_id TEXT DEFAULT '',
+                    related_chunk_ids TEXT DEFAULT '',
                     doc_filename TEXT DEFAULT '',
                     metadata_json TEXT DEFAULT '{}',
                     created_at REAL NOT NULL
@@ -106,9 +109,9 @@ class KnowledgeGraph:
         now = time.time()
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO concepts(id, name, description, category, source_chunk_id, doc_filename, metadata_json, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO concepts(id, name, description, category, source_chunk_id, related_chunk_ids, doc_filename, metadata_json, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (concept.id, concept.name, concept.description, concept.category,
-                 concept.source_chunk_id, concept.doc_filename,
+                 concept.source_chunk_id, concept.related_chunk_ids, concept.doc_filename,
                  json.dumps(concept.metadata, ensure_ascii=False), now),
             )
             conn.commit()
@@ -117,8 +120,8 @@ class KnowledgeGraph:
         now = time.time()
         with sqlite3.connect(self._db_path) as conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO concepts(id, name, description, category, source_chunk_id, doc_filename, metadata_json, created_at) VALUES(?,?,?,?,?,?,?,?)",
-                [(c.id, c.name, c.description, c.category, c.source_chunk_id, c.doc_filename, json.dumps(c.metadata, ensure_ascii=False), now) for c in concepts],
+                "INSERT OR REPLACE INTO concepts(id, name, description, category, source_chunk_id, related_chunk_ids, doc_filename, metadata_json, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                [(c.id, c.name, c.description, c.category, c.source_chunk_id, c.related_chunk_ids, c.doc_filename, json.dumps(c.metadata, ensure_ascii=False), now) for c in concepts],
             )
             conn.commit()
 
@@ -126,21 +129,32 @@ class KnowledgeGraph:
         with sqlite3.connect(self._db_path) as conn:
             row = conn.execute("SELECT * FROM concepts WHERE id=?", (concept_id,)).fetchone()
         if row:
-            return ConceptNode(id=row[0], name=row[1], description=row[2], category=row[3], source_chunk_id=row[4], doc_filename=row[5], metadata=json.loads(row[6]))
+            return ConceptNode(id=row[0], name=row[1], description=row[2], category=row[3], source_chunk_id=row[4], related_chunk_ids=row[5] or "", doc_filename=row[6], metadata=json.loads(row[7]))
         return None
 
     def get_all_concepts(self) -> list[ConceptNode]:
         with sqlite3.connect(self._db_path) as conn:
             rows = conn.execute("SELECT * FROM concepts ORDER BY name").fetchall()
-        return [ConceptNode(id=r[0], name=r[1], description=r[2], category=r[3], source_chunk_id=r[4], doc_filename=r[5], metadata=json.loads(r[6])) for r in rows]
+        return [ConceptNode(id=r[0], name=r[1], description=r[2], category=r[3], source_chunk_id=r[4], related_chunk_ids=r[5] or "", doc_filename=r[6], metadata=json.loads(r[7])) for r in rows]
 
     def search_concepts(self, query: str, limit: int = 10) -> list[ConceptNode]:
+        """Search concepts by name or description.
+
+        Uses bidirectional LIKE matching:
+        - concept contains query (for short keyword queries)
+        - query contains concept (for long NL queries)
+        """
         with sqlite3.connect(self._db_path) as conn:
             rows = conn.execute(
-                "SELECT * FROM concepts WHERE name LIKE ? OR description LIKE ? ORDER BY name LIMIT ?",
-                (f"%{query}%", f"%{query}%", limit),
+                """SELECT * FROM concepts
+                   WHERE name LIKE '%' || ? || '%'
+                      OR description LIKE '%' || ? || '%'
+                      OR ? LIKE '%' || name || '%'
+                      OR ? LIKE '%' || description || '%'
+                   ORDER BY name LIMIT ?""",
+                (query, query, query, query, limit),
             ).fetchall()
-        return [ConceptNode(id=r[0], name=r[1], description=r[2], category=r[3], source_chunk_id=r[4], doc_filename=r[5], metadata=json.loads(r[6])) for r in rows]
+        return [ConceptNode(id=r[0], name=r[1], description=r[2], category=r[3], source_chunk_id=r[4], related_chunk_ids=r[5] or "", doc_filename=r[6], metadata=json.loads(r[7])) for r in rows]
 
     # ---- Relations ----
     def add_relation(self, rel: RelationEdge):
@@ -187,6 +201,44 @@ class KnowledgeGraph:
             rows = conn.execute("SELECT * FROM relations").fetchall()
         return [RelationEdge(id=r[0], source_id=r[1], target_id=r[2], relation_type=r[3], description=r[4]) for r in rows]
 
+    def remove_by_chapter(self, doc_filename: str, chapter_title: str) -> int:
+        """Remove concepts for a specific chapter (by source_chunk_id prefix).
+
+        Returns the number of concepts removed.
+        """
+        if not doc_filename:
+            return 0
+        # Concepts point to chunks like "xxx.pdf_Ch6_0", find those matching
+        # the chapter pattern
+        pattern = f"{doc_filename}_Ch"
+        # Extract chapter number from title: "第6章 关系数据理论" -> "Ch6"
+        import re as _re
+        ch_match = _re.match(r'第\s*([零〇一二三四五六七八九十百千\d]+)\s*[章童篇]', chapter_title)
+        if not ch_match:
+            ch_match = _re.match(r'Chapter\s+(\d+)', chapter_title, re.IGNORECASE)
+        if ch_match:
+            from ..documents.chunker import _parse_cn_number
+            try:
+                ch_num = _parse_cn_number(ch_match.group(1))
+            except Exception:
+                return 0
+        else:
+            return 0
+        chunk_prefix = f"{pattern}{ch_num}_"
+        with sqlite3.connect(self._db_path) as conn:
+            ids = [r[0] for r in conn.execute(
+                "SELECT id FROM concepts WHERE source_chunk_id LIKE ?",
+                (f"{chunk_prefix}%",),
+            ).fetchall()]
+            if not ids:
+                return 0
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(f"DELETE FROM relations WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", ids + ids)
+            conn.execute(f"DELETE FROM concepts WHERE id IN ({placeholders})", ids)
+            conn.commit()
+            logger.info("KG: removed %d concepts for chapter '%s'", len(ids), chapter_title)
+            return len(ids)
+
     def remove_by_doc(self, doc_filename: str) -> int:
         """Remove all concepts and their relations for a given document.
 
@@ -216,18 +268,27 @@ class KnowledgeGraph:
             conn.commit()
 
     def search_concepts_by_docs(self, query: str, doc_filenames: set[str], limit: int = 10) -> list:
-        """Search concepts filtering by document filenames."""
+        """Search concepts filtering by document filenames.
+
+        Uses bidirectional LIKE matching (see search_concepts).
+        """
         if not doc_filenames:
             return self.search_concepts(query, limit)
-        
+
         with sqlite3.connect(self._db_path) as conn:
             placeholders = ",".join("?" * len(doc_filenames))
-            sql = f"SELECT * FROM concepts WHERE (name LIKE ? OR description LIKE ?) AND doc_filename IN ({placeholders}) ORDER BY name LIMIT ?"
-            params = [f"%{query}%", f"%{query}%"] + list(doc_filenames) + [limit]
+            doc_list = list(doc_filenames)
+            sql = (
+                f"SELECT * FROM concepts WHERE "
+                f"(name LIKE '%' || ? || '%' OR description LIKE '%' || ? || '%' "
+                f" OR ? LIKE '%' || name || '%' OR ? LIKE '%' || description || '%') "
+                f"AND doc_filename IN ({placeholders}) ORDER BY name LIMIT ?"
+            )
+            params = [query, query, query, query] + doc_list + [limit]
             rows = conn.execute(sql, params).fetchall()
         return [ConceptNode(id=r[0], name=r[1], description=r[2], category=r[3],
-                           source_chunk_id=r[4], doc_filename=r[5],
-                           metadata=json.loads(r[6])) for r in rows]
+                           source_chunk_id=r[4], related_chunk_ids=r[5] or "", doc_filename=r[6],
+                           metadata=json.loads(r[7])) for r in rows]
 
     def get_doc_names(self) -> list[str]:
         """Get unique document filenames in the graph."""
@@ -250,3 +311,132 @@ class KnowledgeGraph:
             "relations": n_relations,
             "categories": {c[0]: c[1] for c in cats},
         }
+
+    def link_cross_chapter(
+        self,
+        embedding_fn=None,         # sentence-transformers model for embedding
+        similarity_threshold: float = 0.85,
+        llm=None,                 # optional LLM for synonym judgment
+    ) -> int:
+        """Link same/similar concepts across chapters.
+
+        Tier 1: Exact name hash → auto-link (free, deterministic).
+        Tier 2: Embedding cosine similarity top-K → batch LLM synonym
+                judgment → link confirmed synonyms.
+
+        Returns number of new cross-chapter relations added.
+        """
+        import hashlib, re as _re
+        from collections import defaultdict
+
+        all_c = self.get_all_concepts()
+        if len(all_c) < 2:
+            return 0
+
+        # ── Tier 1: Exact name hash ──
+        name_groups: dict[str, list] = defaultdict(list)
+        for c in all_c:
+            name_hash = hashlib.md5(c.name.strip().encode()).hexdigest()
+            name_groups[name_hash].append(c)
+
+        new_relations = 0
+
+        for name_hash, group in name_groups.items():
+            if len(group) < 2:
+                continue
+            # Link all pairs from DIFFERENT chapters (same doc different chapter = link)
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    ci_ch = _re.search(r'_Ch(\d+)_', group[i].source_chunk_id)
+                    cj_ch = _re.search(r'_Ch(\d+)_', group[j].source_chunk_id)
+                    if ci_ch and cj_ch and ci_ch.group(1) == cj_ch.group(1):
+                        continue  # same chapter, skip
+                    rid = hashlib.md5(
+                        f"cross_{group[i].id}_{group[j].id}".encode()).hexdigest()[:12]
+                    self.add_relation(RelationEdge(
+                        id=rid,
+                        source_id=group[i].id,
+                        target_id=group[j].id,
+                        relation_type="related_to",
+                        description=f"同名概念跨章节关联",
+                    ))
+                    new_relations += 1
+
+        logger.info("[cross-chapter] Tier 1 (exact name): +%d relations", new_relations)
+
+        # ── Tier 2: Embedding similarity + LLM synonym ──
+        if embedding_fn is None or llm is None:
+            return new_relations
+
+        try:
+            import numpy as np
+
+            # Embed all concept names (batch)
+            names = [c.name for c in all_c]
+            embeddings = np.array(embedding_fn(names))
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            embeddings = embeddings / norms
+
+            # Find top similar pairs (different names, different chapters)
+            sim_pairs = []
+            for i in range(len(all_c)):
+                for j in range(i + 1, len(all_c)):
+                    if all_c[i].name == all_c[j].name:
+                        continue  # already handled in Tier 1
+                    sim = float(np.dot(embeddings[i], embeddings[j]))
+                    if sim >= similarity_threshold:
+                        # Must be from different chapters
+                        ci_ch = _re.search(r'_Ch(\d+)_', all_c[i].source_chunk_id)
+                        cj_ch = _re.search(r'_Ch(\d+)_', all_c[j].source_chunk_id)
+                        if ci_ch and cj_ch and ci_ch.group(1) != cj_ch.group(1):
+                            sim_pairs.append((sim, all_c[i], all_c[j]))
+
+            if not sim_pairs:
+                logger.info("[cross-chapter] Tier 2: no candidate pairs found")
+                return new_relations
+
+            sim_pairs.sort(key=lambda x: x[0], reverse=True)
+            sim_pairs = sim_pairs[:20]  # top-20 pairs for LLM batch
+
+            # Batch LLM synonym judgment
+            items_text = "\n".join(
+                f"{pi+1}. \"{a.name}\" ↔ \"{b.name}\" (相似度={s:.3f})"
+                for pi, (s, a, b) in enumerate(sim_pairs)
+            )
+            from langchain_core.messages import HumanMessage, SystemMessage
+            prompt = (
+                f"以下是{len(sim_pairs)}对概念名，它们的向量相似度≥{similarity_threshold}。\n"
+                "请判断每对是否是真同义词（可以互换使用的同一概念）。\n"
+                "输出JSON数组，每项包含 index(从1开始) 和 is_synonym(true/false)：\n"
+                f"[{{\"index\": 1, \"is_synonym\": true}}, ...]\n\n{items_text}"
+            )
+            resp = llm.invoke([
+                SystemMessage(content="你是知识图谱专家。只输出JSON数组，不要其他。"),
+                HumanMessage(content=prompt),
+            ])
+            import json as _json
+            text = resp.content if hasattr(resp, "content") else str(resp)
+            m = _re.search(r'\[.*\]', text, _re.DOTALL)
+            if m:
+                judgments = _json.loads(m.group(0))
+                confirmed = {j["index"] - 1 for j in judgments if j.get("is_synonym")}
+                for pi in confirmed:
+                    if pi < len(sim_pairs):
+                        s, a, b = sim_pairs[pi]
+                        rid = hashlib.md5(
+                            f"cross_syn_{a.id}_{b.id}".encode()).hexdigest()[:12]
+                        self.add_relation(RelationEdge(
+                            id=rid,
+                            source_id=a.id,
+                            target_id=b.id,
+                            relation_type="related_to",
+                            description=f"LLM判定同义(sim={s:.3f})",
+                        ))
+                        new_relations += 1
+                logger.info("[cross-chapter] Tier 2 (LLM synonym): +%d relations",
+                             len(confirmed))
+        except Exception as e:
+            logger.warning("[cross-chapter] Tier 2 failed: %s", e)
+
+        return new_relations

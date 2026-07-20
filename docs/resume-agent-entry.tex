@@ -1,0 +1,89 @@
+\documentclass{resume}
+\usepackage{zh_CN-Adobefonts_external}
+\usepackage{linespacing_fix}
+\usepackage{cite}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=cyan,
+    filecolor=magenta,
+    urlcolor=blue,
+}
+
+\begin{document}
+\pagenumbering{gobble}
+
+%***********个人信息**************
+\MyName{阳拓}
+\textbf{\LARGE \hspace{15em}日常实习简历}\\
+\sepspace
+\SimpleEntry{1785383200@qq.com}
+\SimpleEntry{13510210797}
+
+%************照片**************
+\yourphoto{0.14}
+
+%***********教育背景**************
+\section{教育背景}
+\datedsubsection{\textbf{西安交通大学}\quad 软件工程}{2024.9 -- 2028.7}
+\begin{itemize}
+  \item \textbf{GPA}：3.83/4.3（专业前15\%）
+  \item \textbf{荣誉}：校三等奖学金、优秀学生
+\end{itemize}
+
+%***********项目经历**************
+\section{项目经历}
+
+\datedsubsection{\textbf{Eduguide-Agent 文档智能问答系统}}{2026.7--至今}
+  \begin{itemize}
+      \item \textbf{项目描述}：自研 RAG 问答 Agent，实现多格式文档的自动化解析、章节检测、混合索引与知识图谱构建全链路。设计自适应 Agent 管道，支持多轮反思与工具调用，提供基于上传材料的深度问答。
+      \item \textbf{技术栈}：Python、LangChain、FastAPI、ChromaDB、SQLite FTS5、asyncio、Vue 3
+      \item \textbf{核心设计}：
+      \begin{itemize}
+          \item 设计\textbf{自适应 Agent 管道}：Router 三级难度分流 → Planner 复杂问题分解 → Executor 拓扑排序并发执行子问题 → Reflector 审核答案并修正，最多 3 轮迭代，兼顾简单问题的响应速度与复杂问题的推理深度。
+
+          \item 自建\textbf{三路混合检索（RAG 核心）}：ChromaDB 稠密向量 + SQLite FTS5（BM25）稀疏关键词 + 知识图谱扩展，三路并联检索后通过 RRF 倒数排名融合排序，解决单路嵌入在专业术语上的召回盲区。
+
+          \item 实现\textbf{Agent 工具系统}：可扩展工具注册机制（Tool Registry），Agent 可自主调用检索工具获取上下文；Hook 横切层在工具调用前后注入日志、权限校验与 Token 用量追踪，保证可观测性。
+
+          \item \textbf{工程实践}：FastAPI + Vue 3 全栈，SSE 流式推送；asyncio 异步 + Semaphore 并发控制；Pydantic 类型校验自动生成 OpenAPI 文档；完整的 CI/CD 测试管线与 Token 用量监控。
+      \end{itemize}
+  \end{itemize}
+
+\datedsubsection{\textbf{分布式在线教育平台}}{2026.3--2026.5}
+  \begin{itemize}
+      \item \textbf{项目描述}：基于 Spring Cloud 微服务架构的 B2C 在线教育平台，涵盖课程学习、交易支付、社区互动等模块，负责高并发场景下的核心功能设计与性能优化。
+      \item \textbf{技术栈}：Spring Cloud、MySQL、Redis/Redisson、RabbitMQ、XXL-Job、Elasticsearch
+      \item \textbf{核心设计}：
+      \begin{itemize}
+          \item 针对视频播放进度高频上报场景，设计 Redis + DelayQueue 写缓冲与防抖机制，批量落库降低写入压力，保证多端断点续播的准确性。
+
+          \item 基于 Redisson 分布式锁 + RabbitMQ 流量削峰解决秒杀超卖问题；封装 AOP 通用锁组件，解决 Spring 事务提交与锁释放的时序冲突。
+
+          \item 利用 Redis Bitmap 实现海量签到、ZSet 实现实时排行榜，通过 XXL-Job 分片广播将历史数据异步归档至 MySQL 动态分表，解决单表膨胀。
+      \end{itemize}
+  \end{itemize}
+
+
+%***********专业技能**************
+\section{专业技能}
+  \datedsubsection{\textbf{AI 工程}}{
+      \textbf{LLM / Agent}：熟悉 LangChain Agent 编排，掌握 RAG、Tool Use、ReAct 模式，具备多轮反思与自适应管道的工程落地经验。\\
+      \textbf{检索增强（RAG）}：深入 ChromaDB 向量库、SQLite FTS5 全文索引，掌握稠密/稀疏混合检索与 RRF 融合排序。\\
+      \textbf{FastAPI / Python}：熟练 FastAPI 异步框架与 asyncio 并发编程，具备 SSE 流式服务、Pydantic 校验及模块化 API 设计经验。\\
+      \textbf{可观测性}：了解 LLM 调用的 Token 用量追踪、Hook 日志拦截与自动化测试管线搭建。\\
+  }
+  \datedsubsection{\textbf{后端基础}}{
+      \textbf{Java / Spring}：深入理解 JUC 并发包、线程池、JVM 内存模型与 GC；熟练掌握 Spring Boot、MyBatis-Plus，理解 IOC/AOP 原理。\\
+      \textbf{MySQL / Redis / MQ}：深入 InnoDB 索引与锁机制，具备 SQL 调优经验；熟悉 Redis 数据结构与缓存设计；掌握 RabbitMQ 消息投递、延迟队列与流量削峰。\\
+      \textbf{分布式基础}：理解分布式锁（Redisson）、分库分表、定时任务分片等生产级中间件方案。\\
+  }
+
+%***********奖励荣誉**************
+\section{奖励荣誉}
+\datedsubsection{\textbf{英语能力}：}{CET-6：602分}
+\datedsubsection{\textbf{竞赛奖项}：}{美国大学生数学建模竞赛 M奖（2024）}
+\datedsubsection{\textbf{学术荣誉}：}{校三等奖学金、优秀学生（2024-2025）}
+
+\end{document}

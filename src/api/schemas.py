@@ -23,3 +23,4 @@ class ChatRequest(BaseModel):
     question: str
     session_id: str = ""
     doc_filter: list[str] = []
+    tutor_mode: bool = False   # 是否启用"举一反三"引导式习题讲解

@@ -50,6 +50,9 @@ class Executor(BaseAgent):
 
         Returns: [{ "id": 1, "question": "...", "results": [ToolResult, ...] }]
         """
+        from src.harness import _agent_name
+        _agent_name.set("Executor")
+
         if not plan:
             return []
 
@@ -74,6 +77,9 @@ class Executor(BaseAgent):
                 if sub_id not in round_ids:
                     continue
                 tool_name = sub.get("tool", "rag_search")
+                # ★ Route rag_search → rag_skill when available (auto-escalation)
+                if tool_name == "rag_search" and "rag_skill" in self._tools:
+                    tool_name = "rag_skill"
                 if tool_name not in self._tools:
                     logger.warning("Executor: unknown tool '%s' for sub %d", tool_name, sub_id)
                     continue

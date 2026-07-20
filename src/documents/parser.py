@@ -74,21 +74,30 @@ def _parse_pdf(
     # ---- Scanned PDF: no embedded text ----
     body_doc: Document | None = None
 
-    # Phase 2a: local OCR → body text.
-    # page_range: OCR only specific pages (knowledge processing for one chapter).
-    # max_pages: OCR first N pages (chapter detection TOC preview).
-    # Neither: OCR first 20 pages as minimum.
     if page_range:
         _ocr_pages = page_range
     elif max_pages:
         _ocr_pages = (1, min(max_pages, 20))
     else:
         _ocr_pages = (1, 20)
-    logger.info("PDF has no embedded text layer, trying local OCR pages %d-%d",
-                 _ocr_pages[0], _ocr_pages[1])
-    body_doc = _parse_pdf_unstructured(filepath, _ocr_pages[0], _ocr_pages[1])
 
-    # Phase 2b: VLM TOC scan → chapter title list (try regardless of OCR result)
+    # Phase 2a: MinerU cloud OCR (fast, best quality, GPU-accelerated).
+    # Phase 2b: EasyOCR local (fallback, ~8s/page, no Paddle dependency).
+    # Phase 2c: Tesseract local (last resort).
+
+    # Try MinerU first
+    logger.info("PDF has no embedded text layer, trying MinerU cloud OCR pages %d-%d",
+                 _ocr_pages[0], _ocr_pages[1])
+    mineru_text = _parse_pdf_ocr(filepath, page_range=_ocr_pages)
+    if mineru_text and mineru_text.content.strip():
+        body_doc = mineru_text
+        logger.info("[parser] MinerU OCR succeeded: %d chars", len(mineru_text.content))
+    else:
+        # Fallback to EasyOCR
+        logger.info("MinerU failed/empty, falling back to EasyOCR")
+        body_doc = _parse_pdf_unstructured(filepath, _ocr_pages[0], _ocr_pages[1])
+
+    # Phase 2d: VLM TOC scan → chapter title list (try regardless of OCR result)
     logger.info("Scanning for table of contents with VLM (%s pages)",
                  str(max_pages) if max_pages else "all")
     toc_doc = _parse_pdf_vlm(filepath, max_pages)
@@ -100,6 +109,7 @@ def _parse_pdf(
         if body_doc and body_doc.content.strip():
             body_doc.metadata["vlm_chapters"] = vlm_list
             body_doc.metadata["vlm_chapter_ranges"] = vlm_ranges
+            body_doc.metadata["vlm_body_start"] = toc_doc.metadata.get("vlm_body_start", 0)
             body_doc.metadata["parser"] = "local_ocr+vlm_toc"
             logger.info("[parser] VLM %d chapters (with%s page ranges) + OCR %d chars",
                          len(vlm_list),
@@ -199,14 +209,25 @@ def _parse_pdf_vlm(filepath: Path, max_pages: int | None = None) -> Document | N
         # Prompt: find TOC, list chapter titles WITH page numbers.
         # The page numbers let us calculate chapter ranges so knowledge
         # processing can OCR only the selected chapter's pages.
+        #
+        # IMPORTANT: the VLM also identifies which image number (1-indexed,
+        # cover = image 1) the first chapter's actual body content starts on.
+        # This offset corrects for the gap between printed page numbers and
+        # PDF pages (caused by cover, copyright, preface, TOC front matter).
         prompt = (
-            f"这是《{filepath.name}》前{limit}页的扫描图片。"
-            "你的任务是在这些页面中找到目录页，并列出所有一级章节标题及其起始页码。\n\n"
-            "目录页特征：通常有'目录'或'Contents'标题，"
-            "下方列出各章节名及对应页码（如'第一章 静电场……1'，表示第一章从第1页开始）。\n\n"
-            "请逐行输出，格式为：章节标题 | 页码\n"
-            "例如：第一章 静电场的基本规律 | 1\n"
-            "只输出列表，不要其他内容。如果找不到，输出'未找到'。"
+            f"这是《{filepath.name}》前{limit}页的扫描图片（图片1=封面/第1页，图片2=第2页……以此类推）。"
+            "你的任务：\n\n"
+            "1. 在图片中找到目录页，列出所有一级章节标题及起始页码。\n"
+            "   目录页特征：通常有'目录'或'Contents'标题，"
+            "下方列出各章节名及对应页码。\n"
+            "   格式：章节标题 | 页码\n"
+            "   例如：第一章 静电场的基本规律 | 1\n\n"
+            "2. 判断第一个章节的**正文内容**从第几张图片开始。\n"
+            "   （不是目录中列出的页码，而是图片编号。目录页不是正文，\n"
+            "   封面/版权页/前言/目录 这些都算前置页。）\n"
+            "   格式：BODY_START: 数字\n"
+            "   例如：BODY_START: 9   （表示第9张图片是第一章正文的第一页）\n\n"
+            "只输出以上内容，不要其他。如果找不到目录，输出'未找到'。"
         )
 
         _t0 = _time.time()
@@ -224,9 +245,18 @@ def _parse_pdf_vlm(filepath: Path, max_pages: int | None = None) -> Document | N
             logger.warning("[VLM] no TOC/chapters found in %d pages", limit)
             return None
 
+        # Parse BODY_START offset from VLM response.
+        # BODY_START tells us which PDF page (1-indexed) the first chapter's
+        # actual body content begins on — after cover, copyright, preface, TOC.
+        import re as _re
+        body_start = 0
+        bs_match = _re.search(r'BODY_START\s*:\s*(\d+)', resp_text, _re.IGNORECASE)
+        if bs_match:
+            body_start = int(bs_match.group(1))
+            logger.info("[VLM] detected BODY_START = %d (PDF page where Ch1 body begins)", body_start)
+
         # Parse chapter titles and page numbers from VLM response.
         # Expected format per line: "第一章 静电场的基本规律 | 1"
-        import re as _re
         chapter_ranges: list[dict] = []
         for raw_line in resp_text.strip().splitlines():
             line = raw_line.strip().lstrip("-•·1234567890.、 ")
@@ -293,6 +323,7 @@ def _parse_pdf_vlm(filepath: Path, max_pages: int | None = None) -> Document | N
                 "chapters_found": len(chapter_ranges),
                 "vlm_chapters": titles,
                 "vlm_chapter_ranges": chapter_ranges,
+                "vlm_body_start": body_start,  # PDF page where Ch1 body begins (1-indexed)
             },
         )
 
@@ -301,111 +332,204 @@ def _parse_pdf_vlm(filepath: Path, max_pages: int | None = None) -> Document | N
         return None
 
 
+def _vlm_enhance_ocr(
+    ocr_result: list,
+    page_img,
+    doc_name: str = "",
+    page_num: int = 0,
+    confidence_threshold: float = 0.5,
+) -> list:
+    """Enhance EasyOCR results by re-recognizing low-confidence regions with Qwen-VL.
+
+    EasyOCR confidence drops on formulas, special symbols, and degraded CJK.
+    This function crops those regions from the page image, sends them to a
+    vision model (Qwen-VL) which handles formulas naturally, and replaces
+    the low-confidence text with the VLM output.
+
+    Returns the modified ocr_result list (same format).
+    """
+    from src.config import Configuration
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import HumanMessage
+    import base64, io as _io
+
+    # Find low-confidence regions
+    low_conf = [(i, r) for i, r in enumerate(ocr_result) if r[2] < confidence_threshold]
+    if not low_conf:
+        return ocr_result
+
+    # Init VLM (lazy, once per function call)
+    config = Configuration.from_env()
+    vision_model = config.llm_vision_model or config.llm_model_id
+    vision_url = config.llm_vision_base_url or config.llm_base_url
+    vision_key = config.llm_vision_api_key or config.llm_api_key
+
+    if not config.llm_vision_model:
+        logger.debug("[vlm-enhance] no vision model configured, skipping")
+        return ocr_result
+
+    llm = ChatOpenAI(
+        model=vision_model,
+        api_key=vision_key,
+        base_url=vision_url,
+        temperature=0.0,
+        max_tokens=2000,  # batch multi-region output needs more tokens
+    )
+
+    # Batch all low-confidence crops into a single VLM call
+    import cv2
+    crops_b64: list[str] = []
+    crop_indices: list[int] = []
+    for idx, (bbox, text, conf) in low_conf:
+        try:
+            x1, y1 = int(bbox[0][0]), int(bbox[0][1])
+            x2, y2 = int(bbox[2][0]), int(bbox[2][1])
+            h, w = page_img.shape[:2]
+            x1, y1 = max(0, x1 - 5), max(0, y1 - 5)
+            x2, y2 = min(w, x2 + 5), min(h, y2 + 5)
+            crop = page_img[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            _, buf = cv2.imencode(".png", crop)
+            crops_b64.append(base64.b64encode(buf.tobytes()).decode("utf-8"))
+            crop_indices.append(idx)
+        except Exception:
+            continue
+
+    if not crops_b64:
+        return ocr_result
+
+    # Build multi-image prompt
+    image_parts = []
+    region_labels = []
+    for i in range(len(crops_b64)):
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{crops_b64[i]}"},
+        })
+        region_labels.append(f"[{i}]")
+
+    prompt = (
+        f"这是同一页内{len(crops_b64)}个低质量OCR区域的裁图。\n"
+        "请按编号逐个识别每个区域，输出格式：\n"
+        "[0] 识别结果\n[1] 识别结果\n...\n"
+        "如果包含数学公式，用LaTeX（行内$...$，块级$$...$$）。\n"
+        "只输出编号和内容，不要加解释。"
+    )
+
+    msg = HumanMessage(content=[{"type": "text", "text": prompt}] + image_parts)
+    try:
+        resp = llm.invoke([msg])
+        vlm_output = resp.content.strip() if hasattr(resp, "content") else str(resp).strip()
+
+        # Parse batched response: [N] text
+        import re as _re
+        parsed = {}
+        pattern = _re.compile(r'\[(\d+)\]\s*(.*?)(?=\[\d+\]|\Z)', _re.DOTALL)
+        for m in pattern.finditer(vlm_output):
+            idx_str = m.group(1)
+            text = m.group(2).strip()
+            if idx_str.isdigit() and text:
+                parsed[int(idx_str)] = text
+
+        enhanced_count = 0
+        for batch_i, orig_idx in enumerate(crop_indices):
+            vlm_text = parsed.get(batch_i, "").strip()
+            if vlm_text:
+                ocr_result[orig_idx] = (ocr_result[orig_idx][0], vlm_text, 0.7)
+                enhanced_count += 1
+
+        if enhanced_count > 0:
+            logger.info("[vlm-enhance] %s p%d: enhanced %d/%d low-confidence regions (batched)",
+                         doc_name, page_num, enhanced_count, len(low_conf))
+
+    except Exception as e:
+        logger.warning("[vlm-enhance] batch VLM failed: %s", e)
+
+    if enhanced_count > 0:
+        logger.info("[vlm-enhance] %s p%d: enhanced %d/%d low-confidence regions",
+                     doc_name, page_num, enhanced_count, len(low_conf))
+
+    return ocr_result
+
+
 def _parse_pdf_unstructured(
     filepath: Path,
     start_page: int = 1,
     end_page: int = 20,
 ) -> Document:
-    """Parse scanned PDF pages [start_page, end_page] (1-indexed) with local OCR.
-
-    Renders each page as a high-DPI PNG image, then runs Tesseract OCR locally.
-    """
-    import os as _os
-
+    """Parse scanned PDF pages with EasyOCR + VLM enhancement. 3-page concurrent."""
     try:
         import fitz
     except ImportError:
-        logger.warning("[local-ocr] pymupdf not available")
-        return Document(filepath.name, "", 0, {"parser": "local_ocr_error"})
+        logger.warning("[easyocr] pymupdf not available")
+        return Document(filepath.name, "", 0, {"parser": "easyocr_error"})
 
     try:
-        import pytesseract
+        import easyocr, numpy as np, cv2
     except ImportError:
-        logger.warning(
-            "[local-ocr] pytesseract not installed. "
-            "Install with: pip install pytesseract"
-        )
-        return Document(filepath.name, "", 0, {"parser": "local_ocr_error"})
-
-    # Point tesseract to project-local binary and language data
-    _proj_root = Path(__file__).resolve().parent.parent.parent
-    _tessdata_dir = _proj_root / "tessdata"
-    _tesseract_exe = _proj_root / "tesseract-bin" / "tesseract.exe"
-    if _tessdata_dir.is_dir():
-        _os.environ["TESSDATA_PREFIX"] = str(_tessdata_dir)
-    if _tesseract_exe.exists():
-        pytesseract.pytesseract.tesseract_cmd = str(_tesseract_exe)
+        logger.warning("[easyocr] easyocr not installed")
+        return Document(filepath.name, "", 0, {"parser": "easyocr_error"})
 
     try:
-        import io as _io
-        import time as _time
-        from PIL import Image
-
+        import time as _time, concurrent.futures
         _t0 = _time.time()
-
         doc = fitz.open(str(filepath))
         total = len(doc)
         _start = max(0, start_page - 1)
         _end = min(end_page, total)
+        page_count = _end - _start
+        OCVLM_WORKERS = 3
 
-        # Render specified pages to PNG
-        page_images: list[tuple[int, bytes]] = []
-        for i in range(_start, _end):
-            pix = doc[i].get_pixmap(dpi=250)
-            page_images.append((i, pix.tobytes("png")))
-        doc.close()
+        reader = easyocr.Reader(["ch_sim"], gpu=False)
 
-        # OCR pages in parallel — tesseract releases the GIL, so threads work
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        OCR_WORKERS = min(6, max(1, _end - _start))
-        results: dict[int, str] = {}
-
-        def _ocr_page(idx: int, png_data: bytes) -> tuple[int, str | None]:
+        def _process_page(i: int):
             try:
-                img = Image.open(_io.BytesIO(png_data))
-                text = pytesseract.image_to_string(img, lang="chi_sim")
-                return idx, text.strip() if text else None
-            except Exception:
-                return idx, None
+                pix = doc[i].get_pixmap(dpi=200)
+                img = np.frombuffer(pix.tobytes("png"), dtype=np.uint8)
+                img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+                result = reader.readtext(img)
+                try:
+                    result = _vlm_enhance_ocr(result, img, filepath.name, i + 1)
+                except Exception:
+                    pass
+                text = "".join(r[1] for r in result)
+                return (i, text.strip() if text.strip() else None)
+            except Exception as e:
+                logger.warning("[easyocr] page %d failed: %s", i + 1, e)
+                return (i, None)
 
-        with ThreadPoolExecutor(max_workers=OCR_WORKERS) as executor:
-            futures = {
-                executor.submit(_ocr_page, idx, data): idx
-                for idx, data in page_images
-            }
-            for future in as_completed(futures):
-                idx, text = future.result()
+        logger.info("[easyocr] %d pages, %d workers", page_count, OCVLM_WORKERS)
+        results: dict[int, str] = {}
+        pages_done = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=OCVLM_WORKERS) as ex:
+            futures = {ex.submit(_process_page, i): i for i in range(_start, _end)}
+            for future in concurrent.futures.as_completed(futures):
+                i, text = future.result()
+                pages_done += 1
                 if text:
-                    results[idx] = text
+                    results[i] = text
+                if pages_done % 5 == 0:
+                    logger.info("[easyocr] %d/%d pages in %.1fs",
+                                 pages_done, page_count, _time.time() - _t0)
 
-        # Reassemble in page order
-        all_text = [results[i] for i in sorted(results) if results[i]]
-
+        doc.close()
         elapsed = _time.time() - _t0
-
+        all_text = [results[i] for i in sorted(results) if results[i]]
         content = "\n\n".join(all_text)
-        logger.info(
-            "[local-ocr] pages %d-%d (%d/%d OCR'd, %d workers) in %.1fs → %d chars",
-            start_page, end_page, len(all_text), _end - _start, OCR_WORKERS, elapsed, len(content),
-        )
+        logger.info("[easyocr] pages %d-%d: %d/%d pages, %.1fs, %d chars",
+                     start_page, end_page, pages_done, page_count, elapsed, len(content))
 
         return Document(
-            filename=filepath.name,
-            content=content,
-            page_count=total,
-            metadata={
-                "format": "pdf",
-                "parser": "local_ocr",
-                "pages_processed": len(all_text),
-                "chars": len(content),
-                "elapsed_s": round(elapsed, 1),
-            },
+            filename=filepath.name, content=content, page_count=total,
+            metadata={"format": "pdf", "parser": "easyocr", "ocr_engine": "easyocr_crnn",
+                      "dpi": 200, "elapsed_s": round(elapsed, 1)},
         )
 
     except Exception as e:
-        logger.warning("[local-ocr] parsing failed: %s", e)
-        return Document(filepath.name, "", 0, {"parser": "local_ocr_error"})
-
+        logger.error("[easyocr] OCR failed: %s", e)
+        return Document(filepath.name, "", 0, {"parser": "easyocr_error"})
 
 def _parse_pdf_pymupdf_raw(filepath: Path, max_pages: int | None = None) -> Document:
     """Extract embedded text via pymupdf (fast, no OCR)."""
@@ -553,8 +677,7 @@ def _parse_docx(filepath: Path) -> Document:
         metadata={"format": "docx", "paragraph_count": len(paragraphs)},
     )
 
-
-def _parse_pdf_ocr(filepath: Path, max_pages: int | None = None) -> Document:
+def _parse_pdf_ocr(filepath: Path, max_pages: int | None = None, page_range: tuple[int, int] | None = None) -> Document:
     """Parse scanned/image-based PDF using MinerU cloud OCR.
 
     Calls MinerU API (requires MINERU_API_TOKEN in .env).
@@ -565,7 +688,7 @@ def _parse_pdf_ocr(filepath: Path, max_pages: int | None = None) -> Document:
     # Try MinerU cloud API first
     try:
         from src.tools.ocr import parse_pdf as mineru_parse
-        text = mineru_parse(str(filepath), max_pages=max_pages)
+        text = mineru_parse(str(filepath), max_pages=max_pages, page_range=page_range)
         if text.strip():
             pdf_doc = fitz.open(str(filepath))
             total = len(pdf_doc)

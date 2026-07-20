@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os as _os
+# PaddleOCR + PaddlePaddle 2.6 compatibility with protobuf >= 4.x
+_os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import argparse
 import sys
 from pathlib import Path

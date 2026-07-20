@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from ..base import BaseAgent, AgentInput, AgentOutput
 from ...config import Configuration
 from ...prompts.qa.router import SYSTEM_PROMPT, ROUTER_PROMPT
+from ...context_builder import RouterContext, PromptBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -30,15 +31,28 @@ class QuestionRouter(BaseAgent):
 
     async def run(self, input: AgentInput) -> AgentOutput:
         question = input.metadata.get("question", "")
-        history_ctx = input.metadata.get("chat_history", "")
+        # Accept typed RouterContext (preferred) or legacy chat_history string
+        router_ctx = input.metadata.get("router_context")
+        legacy_history = input.metadata.get("chat_history", "")
+
         try:
-            prompt = ROUTER_PROMPT.format(question=question)
-            if history_ctx:
-                prompt += f"\n\n{history_ctx}"
-            resp = await self._llm_retry([
-                SystemMessage(content=prompt),
-                HumanMessage(content="请分析以上问题的难度和类型。"),
-            ])
+            if router_ctx is not None and isinstance(router_ctx, RouterContext):
+                messages = PromptBuilder.build(
+                    system=ROUTER_PROMPT.format(question=question),
+                    context=router_ctx,
+                    user="请分析以上问题的难度和类型。",
+                )
+            else:
+                # Legacy path: string concatenation
+                prompt = ROUTER_PROMPT.format(question=question)
+                if legacy_history:
+                    prompt += f"\n\n{legacy_history}"
+                messages = [
+                    SystemMessage(content=prompt),
+                    HumanMessage(content="请分析以上问题的难度和类型。"),
+                ]
+
+            resp = await self._llm_retry(messages)
             text = resp.content if hasattr(resp, "content") else str(resp)
             data = self._parse_json(text)
             return AgentOutput(success=True, metadata={

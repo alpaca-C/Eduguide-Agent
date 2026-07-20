@@ -78,9 +78,6 @@ export const useDocsStore = defineStore('docs', () => {
     try {
       const data = await get('/files/list')
       files.value = data.files || []
-      if (files.value.length === 0) {
-        try { await fetch('/api/knowledge/clear', { method: 'DELETE' }) } catch { /* ok */ }
-      }
     } catch (e) { console.error('Failed to load files', e) }
   }
 
@@ -92,6 +89,12 @@ export const useDocsStore = defineStore('docs', () => {
       activeDoc.value = null
       chapters.value = []
     }
+  }
+
+  async function clearDocumentKnowledge(filename) {
+    try {
+      await fetch(`/api/knowledge/documents/${encodeURIComponent(filename)}`, { method: 'DELETE' })
+    } catch (e) { console.error('Failed to clear document knowledge', filename, e) }
   }
 
   async function loadChapters(filename) {
@@ -169,6 +172,6 @@ export const useDocsStore = defineStore('docs', () => {
     isDetecting, currentProgress, hasChapterCache,
     selectedChapters, selectedCount,
     startDetection, updateDetection, finishDetection,
-    loadFiles, deleteFile, loadChapters, unimportChapter, selectAll, deselectAll, loadProcessedLabels,
+    loadFiles, deleteFile, clearDocumentKnowledge, loadChapters, unimportChapter, selectAll, deselectAll, loadProcessedLabels,
   }
 })

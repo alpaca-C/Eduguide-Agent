@@ -1,0 +1,366 @@
+[
+  {
+    "question": "《数据库系统概论》第5版被列入了什么国家级规划教材？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_0",
+      "数据库系统概论（第5版） .pdf_3"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "本书可以作为哪些专业的教材？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_1"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "数据管理技术经历了哪三个发展阶段？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_30"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "人工管理阶段的数据处理背景是什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_31",
+      "数据库系统概论（第5版） .pdf_32"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "文件系统阶段的数据管理有什么特点？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_33",
+      "数据库系统概论（第5版） .pdf_34"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据库系统阶段的主要特点是什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_35",
+      "数据库系统概论（第5版） .pdf_46"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "什么是数据？请举例说明。",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_24"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "数据与其语义是什么关系？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_25"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "什么是数据库？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_26"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "数据库管理系统（DBMS）位于用户与什么之间？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_27"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "数据库管理系统（DBMS）的主要功能包括哪些？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_27",
+      "数据库系统概论（第5版） .pdf_28"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据操纵语言（DML）可以实现哪些基本操作？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_28"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "数据库系统（DBS）由哪几部分组成？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_29"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据库管理员（DBA）的职责是什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_29"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据处理的中心问题是什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_30"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "什么是数据模型？它在数据库系统中的作用是什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_47",
+      "数据库系统概论（第5版） .pdf_48"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据模型应满足哪三方面的要求？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_48"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "概念模型和逻辑模型有什么区别？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_49",
+      "数据库系统概论（第5版） .pdf_50"
+    ],
+    "difficulty": "hard"
+  },
+  {
+    "question": "概念模型在数据库设计中的作用是什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_51"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "在概念模型中，什么是实体、属性和码？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_52"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "实体之间的联系有哪几种类型？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_53",
+      "数据库系统概论（第5版） .pdf_54"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "数据模型通常由哪三部分组成？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_55"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据结构的定义是什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_55"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "数据操作主要包括哪两大类？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_56"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "什么是数据的完整性约束条件？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_56",
+      "数据库系统概论（第5版） .pdf_57"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "常用的数据模型有哪些？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_49"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "层次模型的数据结构是什么样的？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_60",
+      "数据库系统概论（第5版） .pdf_61",
+      "数据库系统概论（第5版） .pdf_62"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "层次模型有什么优缺点？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_64",
+      "数据库系统概论（第5版） .pdf_65"
+    ],
+    "difficulty": "hard"
+  },
+  {
+    "question": "网状模型与层次模型相比，克服了什么弊病？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_65"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "满足哪两个条件的层次联系集合称为网状模型？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_66"
+    ],
+    "difficulty": "hard"
+  },
+  {
+    "question": "在网状模型中，为什么需要为联系命名？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_67"
+    ],
+    "difficulty": "hard"
+  },
+  {
+    "question": "什么是数据的物理独立性？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_44"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "什么是数据的逻辑独立性？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_44"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据库管理系统如何保证数据的安全性？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_45"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据的完整性检查是指什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_45"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "什么是并发控制？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_45",
+      "数据库系统概论（第5版） .pdf_46"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据库系统阶段的数据共享有什么好处？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_43"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "数据库系统中的数据是如何组织的？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_41",
+      "数据库系统概论（第5版） .pdf_42"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "文件系统管理数据时，为什么数据冗余度大？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_34"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "人工管理阶段，应用程序与数据之间是什么关系？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_32"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "本书第5版相比第4版，在新技术篇中增加了哪些内容？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_5"
+    ],
+    "difficulty": "hard"
+  },
+  {
+    "question": "本书配套的教学资源可以在哪些网站找到？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_6"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "本书的修订过程中参考了哪些资料？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_8"
+    ],
+    "difficulty": "easy"
+  },
+  {
+    "question": "关系模型的完整性约束包括哪些？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_9"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "SELECT语句的一般格式是什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_10"
+    ],
+    "difficulty": "hard"
+  },
+  {
+    "question": "什么是强制存取控制方法？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_11"
+    ],
+    "difficulty": "hard"
+  },
+  {
+    "question": "数据库完整性包括哪些类型？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_11"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "什么是实体完整性？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_11"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "什么是参照完整性？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_11"
+    ],
+    "difficulty": "moderate"
+  },
+  {
+    "question": "关系数据理论的核心问题是什么？",
+    "chunks": [
+      "数据库系统概论（第5版） .pdf_0_v1"
+    ],
+    "difficulty": "hard"
+  }
+]

@@ -23,7 +23,7 @@ from src.agents.chapterizer import _split_by_meta
 from .schemas import ChapterDetectRequest, SaveChaptersRequest
 from .deps import (
     chapter_agent, chapters_cache, uploaded_files,
-    _save_chapters, _load_chapters, kg, vs,
+    _save_chapters, _load_chapters, kg, vs, UPLOAD_DIR,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,6 +115,23 @@ async def _detect_one_file_impl(
         vlm_ranges: dict[str, dict] = {}
         for _r in (preview_doc.metadata.get("vlm_chapter_ranges") or []):
             vlm_ranges[_r["title"]] = _r
+
+        # Compute TOC offset: the gap between printed page numbers (from TOC)
+        # and actual PDF pages (after cover/copyright/preface/TOC).
+        # VLM reports body_start = which PDF page (1-indexed) Ch1 content begins.
+        # toc_offset = body_start - first_chapter_printed_page
+        _vlm_body_start = preview_doc.metadata.get("vlm_body_start") or 0
+        toc_offset = 0
+        if _vlm_body_start > 0 and vlm_ranges:
+            _first_range = next(iter(vlm_ranges.values()))
+            _first_printed = _first_range.get("start_page", 0)
+            if _first_printed > 0:
+                toc_offset = _vlm_body_start - _first_printed
+                logger.info(
+                    "[API CHAPTERIZE] %s | toc_offset=%d (body_start=%d - first_printed=%d)",
+                    fname, toc_offset, _vlm_body_start, _first_printed,
+                )
+
         # Check which chapters already have chunks in vector store
         _imported_chapters = vs.get_imported_chapter_titles(fname) if vs else set()
         chapter_list = []
@@ -145,6 +162,7 @@ async def _detect_one_file_impl(
                 "full_path": full_path,
                 "start_page": _range.get("start_page", 0) if _range else 0,
                 "end_page": _range.get("end_page", 0) if _range else 0,
+                "toc_offset": toc_offset,
             }
 
         _t3 = _time.time()
@@ -282,13 +300,28 @@ async def save_chapters(req: SaveChaptersRequest):
     """Save detected chapters to persistent storage."""
     if not req.filename:
         raise HTTPException(400, "filename is required")
-    _save_chapters(req.filename, req.chapters)
+
+    # Enrich with page ranges from in-memory cache (frontend may drop them)
+    enriched = []
+    for ch in req.chapters:
+        label = ch.get("label", "")
+        cached = chapters_cache.get(label, {})
+        enriched.append({
+            **ch,
+            "start_page": ch.get("start_page") or cached.get("start_page", 0),
+            "end_page": ch.get("end_page") or cached.get("end_page", 0),
+            "start_marker": ch.get("start_marker") or cached.get("start_marker", ch.get("title", "")),
+            "toc_offset": ch.get("toc_offset") or cached.get("toc_offset", 0),
+        })
+
+    _save_chapters(req.filename, enriched)
     return {"status": "ok"}
 
 
 @router.get("/{filename}")
 async def get_chapters(filename: str):
-    """Get cached chapters for a file."""
+    """Get cached chapters for a file. Also restores page ranges to memory
+    so processing works after server restart without re-detection."""
     chapters = _load_chapters(filename)
     _imported_chapters = vs.get_imported_chapter_titles(filename) if vs else set()
     for ch in chapters:
@@ -297,4 +330,18 @@ async def get_chapters(filename: str):
             t.replace("：", "").replace(":", "").replace(" ", "")
             for t in _imported_chapters
         }
+        # Restore to memory cache so knowledge processing has page ranges
+        label = ch.get("label", f"[{filename}] {ch.get('title', '')}")
+        if label not in chapters_cache:
+            chapters_cache[label] = {
+                "filename": filename,
+                "title": ch.get("title", ""),
+                "text": ch.get("text_preview", ""),
+                "level": ch.get("level", 1),
+                "start_marker": ch.get("start_marker", ch.get("title", "")),
+                "full_path": str(UPLOAD_DIR / filename),
+                "start_page": ch.get("start_page", 0),
+                "end_page": ch.get("end_page", 0),
+                "toc_offset": ch.get("toc_offset", 0),
+            }
     return {"chapters": chapters}
