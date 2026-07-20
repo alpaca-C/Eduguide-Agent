@@ -1,4 +1,12 @@
-# Memory Store — SQLite + Qdrant 双存储，提供搜索缓存和会话记忆
+# Memory Store — SQLite-backed session memory, search cache, and plan cache
+#
+# Pure SQLite storage. No vector / semantic caching — that lives in src/cache/.
+#
+# Tables:
+#   session_messages — conversation history (short-term memory)
+#   search_cache     — exact-match search result cache (episodic memory)
+#   plan_cache       — exact-match planner output cache (episodic memory)
+#   sessions         — session metadata
 
 from __future__ import annotations
 
@@ -12,45 +20,19 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Lazy imports
-_qdrant_client = None
-_embedding_model = None
-
-def _get_qdrant_client(url: str, api_key: str):
-    global _qdrant_client
-    if _qdrant_client is None:
-        from qdrant_client import QdrantClient
-        _qdrant_client = QdrantClient(url=url, api_key=api_key, timeout=20)
-    return _qdrant_client
-
-def _get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embedding_model
-
-def _embed(text: str) -> list[float]:
-    """将文本转为向量嵌入（384 维）。"""
-    model = _get_embedding_model()
-    return model.encode(text, normalize_embeddings=True).tolist()
 
 def _hash_query(query: str) -> str:
     return hashlib.sha256(query.strip().lower().encode()).hexdigest()[:16]
 
 
 class MemoryStore:
-    """SQLite + Qdrant 混合记忆存储。
+    """SQLite 记忆存储 — 纯精确匹配，无语义搜索。
 
     SQLite: 精确匹配缓存（查询哈希 → 搜索结果 / 规划）
-    Qdrant: 语义相似度缓存（跨会话复用）
+    语义缓存: 已迁移到 src/cache/semantic_cache.py (Qdrant)
     """
 
-    SEARCH_COLLECTION = "search_cache"
-    PLAN_COLLECTION = "plan_cache"
-    VECTOR_SIZE = 384  # all-MiniLM-L6-v2
-
-    def __init__(self, db_path: str = "", qdrant_url: str = "", qdrant_api_key: str = ""):
+    def __init__(self, db_path: str = ""):
         if db_path:
             p = Path(db_path)
             if p.is_dir() or p.suffix == "":
@@ -61,13 +43,7 @@ class MemoryStore:
             default_dir = Path(__file__).resolve().parent.parent.parent / "data"
             default_dir.mkdir(parents=True, exist_ok=True)
             self._db_path = str(default_dir / "memory.db")
-        self._qdrant_url = qdrant_url
-        self._qdrant_api_key = qdrant_api_key
-        self._use_qdrant = bool(qdrant_url and qdrant_api_key)
-
         self._init_sqlite()
-        if self._use_qdrant:
-            self._init_qdrant()
 
     # ==================================================================
     # SQLite
@@ -122,33 +98,10 @@ class MemoryStore:
             conn.commit()
 
     # ==================================================================
-    # Qdrant
-    # ==================================================================
-    def _init_qdrant(self):
-        try:
-            logger.info("Connecting to Qdrant Cloud...")
-            client = _get_qdrant_client(self._qdrant_url, self._qdrant_api_key)
-            from qdrant_client.models import Distance, VectorParams
-            for name in [self.SEARCH_COLLECTION, self.PLAN_COLLECTION]:
-                try:
-                    client.get_collection(name)
-                    logger.info("Qdrant collection exists: %s", name)
-                except Exception:
-                    client.create_collection(
-                        collection_name=name,
-                        vectors_config=VectorParams(size=self.VECTOR_SIZE, distance=Distance.COSINE),
-                    )
-                    logger.info("Created Qdrant collection: %s", name)
-            logger.info("Qdrant connected successfully")
-        except Exception as e:
-            logger.warning("Qdrant init failed, falling back to SQLite-only: %s", e)
-            self._use_qdrant = False
-
-    # ==================================================================
-    # Search Cache
+    # Search Cache (exact match only)
     # ==================================================================
     def cache_search_result(self, query: str, results: list, answer: str = ""):
-        """缓存搜索结果到 SQLite + Qdrant。"""
+        """Cache search result by exact query hash (SQLite only)."""
         query_hash = _hash_query(query)
         payload = {
             "results": [{"title": r.title, "url": r.url, "content": r.content, "score": r.score} for r in results],
@@ -163,24 +116,11 @@ class MemoryStore:
             )
             conn.commit()
 
-        if self._use_qdrant:
-            try:
-                client = _get_qdrant_client(self._qdrant_url, self._qdrant_api_key)
-                from qdrant_client.models import PointStruct
-                vector = _embed(query)
-                client.upsert(
-                    collection_name=self.SEARCH_COLLECTION,
-                    points=[PointStruct(id=query_hash, vector=vector, payload={"query": query, "ts": now})],
-                )
-            except Exception as e:
-                logger.warning("Qdrant search cache upsert failed: %s", e)
-
     def get_cached_search(self, query: str) -> Optional[tuple[list, str]]:
-        """查询搜索缓存，先精确匹配 SQLite，再语义搜索 Qdrant。"""
+        """Look up cached search result by exact query hash."""
         query_hash = _hash_query(query)
         now = time.time()
 
-        # 1) SQLite 精确匹配
         with sqlite3.connect(self._db_path) as conn:
             row = conn.execute(
                 "SELECT results_json, created_at, ttl_days FROM search_cache WHERE query_hash = ?",
@@ -197,16 +137,13 @@ class MemoryStore:
                     logger.info("search cache HIT (exact): %s", query[:50])
                     return results, payload.get("answer", "")
 
-        # 2) Qdrant 语义搜索（已禁用同步读取，避免跨洲延迟阻塞）
-        # 如需启用，取消下方注释。建议改用国内的向量数据库（如 Zilliz Cloud）
-
         return None
 
     # ==================================================================
-    # Plan Cache
+    # Plan Cache (exact match only)
     # ==================================================================
     def cache_plan(self, topic: str, plan: list[dict], background: str = ""):
-        """缓存规划结果。"""
+        """Cache planner output by exact topic hash (SQLite only)."""
         topic_hash = _hash_query(topic)
         now = time.time()
 
@@ -217,23 +154,10 @@ class MemoryStore:
             )
             conn.commit()
 
-        if self._use_qdrant:
-            try:
-                client = _get_qdrant_client(self._qdrant_url, self._qdrant_api_key)
-                from qdrant_client.models import PointStruct
-                vector = _embed(topic)
-                client.upsert(
-                    collection_name=self.PLAN_COLLECTION,
-                    points=[PointStruct(id=topic_hash, vector=vector, payload={"topic": topic, "ts": now, "n_blocks": len(plan)})],
-                )
-            except Exception as e:
-                logger.warning("Qdrant plan cache upsert failed: %s", e)
-
     def get_cached_plan(self, topic: str) -> Optional[tuple[list[dict], str]]:
-        """查询缓存的规划结果。返回 (plan_items, background) 或 None。"""
+        """Look up cached plan by exact topic hash. Returns (plan_items, background) or None."""
         topic_hash = _hash_query(topic)
 
-        # 1) SQLite
         with sqlite3.connect(self._db_path) as conn:
             row = conn.execute(
                 "SELECT plan_json, background_json FROM plan_cache WHERE topic_hash = ?",
@@ -244,8 +168,6 @@ class MemoryStore:
                 bg = json.loads(row[1]).get("bg", "")
                 logger.info("plan cache HIT (exact): %s", topic[:50])
                 return plan, bg
-
-        # 2) Qdrant 语义搜索（已禁用同步读取）
 
         return None
 
@@ -273,6 +195,7 @@ class MemoryStore:
                     "report": row[2],
                 }
         return None
+
     def delete_session(self, session_id: str):
         """Delete a session and its chat messages."""
         with sqlite3.connect(self._db_path) as conn:
@@ -283,7 +206,6 @@ class MemoryStore:
     def list_sessions(self) -> list[dict]:
         """List all saved sessions ordered by updated_at descending."""
         with sqlite3.connect(self._db_path) as conn:
-            # Ensure updated_at column exists (migration for old DBs)
             try:
                 rows = conn.execute(
                     "SELECT session_id, topic, created_at, updated_at, report FROM sessions ORDER BY COALESCE(updated_at, created_at) DESC"
@@ -327,4 +249,3 @@ class MemoryStore:
                 (session_id,),
             ).fetchall()
         return [{"role": row[0], "content": row[1], "created_at": row[2]} for row in rows]
-

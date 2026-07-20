@@ -1,0 +1,15 @@
+\datedsubsection{\textbf{Eduguide 文档处理与混合检索平台}}{2026.7--至今}
+  \begin{itemize}
+      \item \textbf{项目描述}：基于 FastAPI 的文档处理与混合检索引擎，支持多格式文档解析、异步 ETL 流水线与多级索引构建，提供高性能多路混合检索服务。前后端分离架构，SSE 流式推送实时进度。
+      \item \textbf{技术栈}：Python、FastAPI、ChromaDB、SQLite FTS5、Pydantic、asyncio、Vue 3
+      \item \textbf{核心功能与系统设计}：
+      \begin{itemize}
+          \item 设计\textbf{多数据库混合检索架构}：ChromaDB 稠密向量 + SQLite FTS5（BM25）稀疏关键词 + 知识图谱三路并联检索，通过 \textbf{RRF 倒数排名融合}算法解决不同检索器分数量纲不一致问题，覆盖语义匹配与精确术语双重召回场景。
+
+          \item 实现\textbf{异步 ETL 文档处理流水线}：asyncio 原生异步 + SSE 流式推送实时进度；\texttt{asyncio.to\_thread} 将 CPU 密集型解析/分块任务移交线程池，避免事件循环阻塞；\textbf{Semaphore} 控制并发数，防止下游服务过载。
+
+          \item 设计\textbf{多存储一致性保障机制}：6 模块化 Router 的 RESTful API，实现 ChromaDB + FTS5 + KG + 内存缓存四层间的级联删除与状态同步；支持文档级、章节级精确清库，保证前端展示与底层数据一致。
+
+          \item 自建\textbf{依赖注入容器}（AppContext）统一管理共享服务实例，支持测试隔离；Pydantic 类型校验自动生成 OpenAPI 文档；Hook 横切机制实现日志、Token 用量监控等非侵入式功能。
+      \end{itemize}
+  \end{itemize}

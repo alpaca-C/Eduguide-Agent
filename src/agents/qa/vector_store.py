@@ -1,7 +1,7 @@
-# DocumentVectorStore — ChromaDB dense + SQLite FTS5 sparse hybrid search
+# DocumentVectorStore — ChromaDB dense + jieba BM25 sparse hybrid search
 #
 # Dense:  Qwen3-Embedding-0.6B → ChromaDB (semantic, cross-lingual)
-# Sparse: SQLite FTS5 with BM25 (keyword, exact term match)
+# Sparse: jieba BM25 (in-memory, keyword match)
 #
 # Combined via RRF (Reciprocal Rank Fusion) in rag_search.py
 
@@ -11,6 +11,8 @@ import logging
 import os
 import sqlite3
 from pathlib import Path
+
+import hashlib
 
 import chromadb
 from chromadb.config import Settings
@@ -69,13 +71,13 @@ class CrossLingualEmbeddingFunction(EmbeddingFunction):
 
 
 class DocumentVectorStore:
-    """Hybrid vector store: ChromaDB (dense) + SQLite FTS5 (sparse).
+    """Hybrid vector store: ChromaDB (dense) + jieba BM25 (sparse).
 
     Incremental indexing: new chunks appended without rebuilding.
     Each chunk carries doc_filename + chapter_title metadata.
     """
 
-    COLLECTION_NAME = "document_chunks_qwen3"
+    COLLECTION_NAME = "document_chunks"
 
     def __init__(self, storage_dir: str = ""):
         if storage_dir:
@@ -88,20 +90,18 @@ class DocumentVectorStore:
         self._ef = CrossLingualEmbeddingFunction()
         self._all_texts: list[str] = []
         self._all_metas: list[dict] = []
-        self._content_hashes: set[int] = set()
+        self._content_hashes: set[str] = set()
         self._client = chromadb.PersistentClient(path=persist_dir, settings=Settings(anonymized_telemetry=False))
         self._ensure_collection()
 
-        # --- Sparse: SQLite FTS5 ---
-        fts_path = str(Path(persist_dir) / "fts_index.db")
-        self._fts_conn = sqlite3.connect(fts_path, check_same_thread=False)
-        self._fts_conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
-                chunk_id, text, doc_filename, chapter_title,
-                tokenize='unicode61 remove_diacritics 2'
-            )
-        """)
-        self._fts_conn.commit()
+        # --- Sparse: jieba BM25 (built lazily on first search) ---
+        self._bm25_valid = False
+
+    @staticmethod
+    def _text_hash(text: str) -> str:
+        """Deterministic content hash (MD5). Unlike Python's hash(),
+        this survives process restarts, making dedup work correctly."""
+        return hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
     # ── ChromaDB ───────────────────────────────────────────────
 
@@ -115,7 +115,7 @@ class DocumentVectorStore:
             if existing and existing.get("documents"):
                 self._all_texts = list(existing["documents"])
                 self._all_metas = list(existing.get("metadatas", []))
-                self._content_hashes = {hash(t) for t in self._all_texts}
+                self._content_hashes = {self._text_hash(t) for t in self._all_texts}
             logger.info("ChromaDB: loaded %d chunks from existing collection", len(self._all_texts))
         except Exception as _e:
             # Only create a NEW collection if one genuinely doesn't exist.
@@ -147,11 +147,10 @@ class DocumentVectorStore:
             return
         self._all_texts = [self._all_texts[i] for i in keep_idx]
         self._all_metas = [self._all_metas[i] for i in keep_idx]
-        self._content_hashes = {hash(t) for t in self._all_texts}
+        self._content_hashes = {self._text_hash(t) for t in self._all_texts}
         try:
             self._collection.delete(where={"doc_filename": doc_filename})
-            self._fts_conn.execute("DELETE FROM chunk_fts WHERE doc_filename = ?", (doc_filename,))
-            self._fts_conn.commit()
+            pass  # BM25 rebuilt on next search
         except Exception as e:
             logger.warning("ChromaDB delete doc '%s' failed: %s", doc_filename, e)
         logger.info("ChromaDB+FTS: removed %d chunks for '%s', %d remaining", removed, doc_filename, len(self._all_texts))
@@ -163,28 +162,33 @@ class DocumentVectorStore:
         """
         if not doc_filename:
             return 0
-        keep_idx = [
-            i for i, m in enumerate(self._all_metas)
-            if not (m.get("doc_filename") == doc_filename and m.get("chapter_title") == chapter_title)
-        ]
-        removed = len(self._all_texts) - len(keep_idx)
-        if removed == 0:
+
+        # Find chunk IDs to delete (ChromaDB where only supports single-field,
+        # so filter in Python and delete by IDs)
+        ids_to_delete = []
+        data = self._collection.get(include=["metadatas"])
+        for cid, meta in zip(data["ids"], data["metadatas"]):
+            if (meta or {}).get("doc_filename") == doc_filename and \
+               (meta or {}).get("chapter_title") == chapter_title:
+                ids_to_delete.append(cid)
+
+        if not ids_to_delete:
             return 0
-        self._all_texts = [self._all_texts[i] for i in keep_idx]
-        self._all_metas = [self._all_metas[i] for i in keep_idx]
-        self._content_hashes = {hash(t) for t in self._all_texts}
+
+        removed = len(ids_to_delete)
         try:
-            self._collection.delete(where={
-                "doc_filename": doc_filename,
-                "chapter_title": chapter_title,
-            })
-            self._fts_conn.execute(
-                "DELETE FROM chunk_fts WHERE doc_filename = ? AND chapter_title = ?",
-                (doc_filename, chapter_title),
-            )
-            self._fts_conn.commit()
+            self._collection.delete(ids=ids_to_delete)
+            pass  # BM25 rebuilt on next search
         except Exception as e:
             logger.warning("ChromaDB+FTS chapter delete failed: %s", e)
+            return 0
+
+        # Rebuild in-memory state from ChromaDB (source of truth)
+        reloaded = self._collection.get(include=["documents", "metadatas"])
+        self._all_texts = list(reloaded["documents"])
+        self._all_metas = list(reloaded["metadatas"])
+        self._content_hashes = {self._text_hash(t) for t in self._all_texts}
+
         logger.info("ChromaDB+FTS: removed %d chunks for '%s' / '%s', %d remaining",
                      removed, doc_filename, chapter_title, len(self._all_texts))
         return removed
@@ -228,7 +232,7 @@ class DocumentVectorStore:
         new_entries: list[dict] = []
         for c in valid:
             text = c["text"][:2000]
-            h = hash(text)
+            h = self._text_hash(text)
             if h not in self._content_hashes:
                 self._content_hashes.add(h)
                 new_entries.append({**c, "text": text})
@@ -244,15 +248,42 @@ class DocumentVectorStore:
         } for c in new_entries]
 
         # Dense: ChromaDB
+        # Use provided chunk_id when available (BEIR eval needs BEIR doc_ids),
+        # otherwise auto-generate sequential IDs.
         self._all_texts.extend(new_texts)
         self._all_metas.extend(new_metas)
         embeddings = self._ef(new_texts)
         existing_count = self._collection.count()
-        new_ids = [f"chunk_{existing_count + i}" for i in range(len(new_texts))]
+
+        # Load existing IDs from ChromaDB to prevent cross-batch collisions
+        # (e.g. processing Ch2 after Ch6 already indexed — both start from _0)
+        try:
+            existing_ids = set(self._collection.get(include=[])["ids"])
+        except Exception:
+            existing_ids = set()
+
+        # Generate unique IDs — handle multi-chapter processing where
+        # the same filename produces duplicate chunk_ids.
+        seen_ids: set[str] = set(existing_ids)  # pre-seed with existing
+        new_ids = []
+        for i, c in enumerate(new_entries):
+            base_id = c.get("chunk_id") or f"chunk_{existing_count + i}"
+            cid = base_id
+            suffix = 1
+            while cid in seen_ids:
+                cid = f"{base_id}_v{suffix}"
+                suffix += 1
+            seen_ids.add(cid)
+            new_ids.append(cid)
+
         self._collection.add(ids=new_ids, documents=new_texts, metadatas=new_metas, embeddings=embeddings)
 
-        # Sparse: FTS5
-        fts_rows = [(cid, t, m["doc_filename"], m["chapter_title"])
+        # Sparse: invalidate BM25 index — rebuilt lazily on next search
+        # (OCR often inserts spaces between Chinese characters, breaking tokenization)
+        def _normalize_cjk(text: str) -> str:
+            import re
+            return re.sub(r'(?<=[一-鿿]) +(?=[一-鿿])', '', text)
+        fts_rows = [(cid, _normalize_cjk(t), m["doc_filename"], m["chapter_title"])
                       for cid, t, m in zip(new_ids, new_texts, new_metas)]
         self._fts_conn.executemany(
             "INSERT INTO chunk_fts (chunk_id, text, doc_filename, chapter_title) VALUES (?, ?, ?, ?)",
@@ -274,10 +305,12 @@ class DocumentVectorStore:
             results = self._collection.query(query_embeddings=[query_embedding], **kwargs)
             docs = results.get("documents", [[]])[0]
             metas = results.get("metadatas", [[]])[0]
+            ids = results.get("ids", [[]])[0]
             out = []
             for i, d in enumerate(docs):
                 if d:
                     out.append({
+                        "chunk_id": ids[i] if i < len(ids) else "",
                         "text": d,
                         "doc_filename": metas[i].get("doc_filename", "") if i < len(metas) else "",
                         "chapter_title": metas[i].get("chapter_title", "") if i < len(metas) else "",
@@ -290,42 +323,107 @@ class DocumentVectorStore:
 
     # ── Sparse search (FTS5) ───────────────────────────────────
 
-    def _search_sparse(self, query: str, top_k: int = 10, filter_docs: set[str] | None = None) -> list[dict]:
-        """BM25 keyword search via SQLite FTS5."""
+        # ── Sparse search (jieba BM25, in-memory) ────────────────────
+
+    def _build_bm25(self):
+        """Build in-memory jieba BM25 index from all chunk texts."""
+        import math, re
+        from collections import defaultdict
+        import jieba as _jieba
+
+        idx = defaultdict(lambda: defaultdict(float))
+        self._bm25_docs: dict[str, dict] = {}
+        doc_count = 0
+        total_len = 0
+
+        ids = self._collection.get(include=[])['ids']
+        for i, (text, meta) in enumerate(zip(self._all_texts, self._all_metas)):
+            cid = ids[i] if i < len(ids) else f"chunk_{i}"
+            clean = re.sub(r'(?<=[一-鿿]) +(?=[一-鿿])', '', text or '')
+            words = [w.strip() for w in _jieba.cut(clean) if len(w.strip()) >= 2]
+            self._bm25_docs[cid] = {
+                'text': clean, 'doc_filename': meta.get('doc_filename', ''),
+                'chapter_title': meta.get('chapter_title', ''), 'word_count': len(words),
+            }
+            for w in set(words):
+                idx[w][cid] = words.count(w)
+            doc_count += 1
+            total_len += len(words)
+
+        self._bm25_idx = idx
+        self._bm25_N = doc_count
+        self._bm25_avgdl = total_len / max(1, doc_count)
+        self._bm25_valid = True
+        logger.info("BM25 index built: %d docs, avg len=%.1f tokens", doc_count, self._bm25_avgdl)
+        # Persist to SQLite for hot restart
         try:
-            # FTS5 query: escape special chars, wrap terms in quotes for phrase matching
-            clean = query.replace('"', '').replace("'", "''")
-            cursor = self._fts_conn.cursor()
-            if filter_docs:
-                placeholders = ",".join("?" * len(filter_docs))
-                sql = f"""
-                    SELECT chunk_id, text, doc_filename, chapter_title, rank
-                    FROM chunk_fts WHERE chunk_fts MATCH ? AND doc_filename IN ({placeholders})
-                    ORDER BY rank LIMIT ?
-                """
-                cursor.execute(sql, (clean, *filter_docs, top_k))
-            else:
-                cursor.execute(
-                    "SELECT chunk_id, text, doc_filename, chapter_title, rank FROM chunk_fts WHERE chunk_fts MATCH ? ORDER BY rank LIMIT ?",
-                    (clean, top_k),
-                )
-            rows = cursor.fetchall()
-            out = []
-            for r in rows:
-                out.append({
-                    "text": r[1],
-                    "doc_filename": r[2] or "",
-                    "chapter_title": r[3] or "",
-                    "source": "sparse",
-                })
-            logger.debug("FTS5: %d results for '%s'", len(out), query[:60])
-            return out
+            import pickle, sqlite3
+            from pathlib import Path as _P
+            db_path = str(_P(__file__).resolve().parent.parent.parent.parent / "data" / "chroma" / "bm25_cache.db")
+            db_path = _P(db_path).parent
+            db_path = str(_P(db_path) / "bm25_cache.db")
+            logger.info("[BM25] saving cache to %s", db_path)
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE IF NOT EXISTS bm25 (key TEXT PRIMARY KEY, data BLOB)")
+            data_blob = pickle.dumps((dict(self._bm25_idx), self._bm25_docs, self._bm25_N, self._bm25_avgdl), protocol=4)
+            conn.execute("INSERT OR REPLACE INTO bm25 (key, data) VALUES (?, ?)", ("index", data_blob))
+            conn.commit(); conn.close()
+            logger.info("[BM25] cache saved: %d KB", len(data_blob) // 1024)
         except Exception as e:
-            # FTS5 may fail on malformed queries — fall back gracefully
-            logger.debug("FTS5 search failed (may be malformed query): %s", e)
+            logger.warning("[BM25] save failed: %s", e)
+
+    def _search_sparse(self, query: str, top_k: int = 10, filter_docs: set[str] | None = None) -> list[dict]:
+        """jieba BM25 keyword search (in-memory)."""
+        import math, re
+        import jieba as _jieba
+
+        if not getattr(self, '_bm25_valid', False):
+            # Try load persisted BM25 first
+            try:
+                import pickle, sqlite3
+                from pathlib import Path as _P
+                db_path = str(_P(__file__).resolve().parent.parent.parent.parent / "data" / "chroma" / "bm25_cache.db")
+                conn = sqlite3.connect(db_path)
+                row = conn.execute("SELECT data FROM bm25 WHERE key='index'").fetchone()
+                conn.close()
+                if row:
+                    self._bm25_idx, self._bm25_docs, self._bm25_N, self._bm25_avgdl = pickle.loads(row[0])
+                    self._bm25_valid = True
+                    logger.info("BM25 loaded from cache: %d docs", self._bm25_N)
+            except Exception: pass
+        if not getattr(self, '_bm25_valid', False):
+            self._build_bm25()
+
+        clean = re.sub(r'(?<=[一-鿿]) +(?=[一-鿿])', '', query)
+        qwords = [w.strip() for w in _jieba.cut(clean) if len(w.strip()) >= 2]
+        if not qwords:
             return []
 
-    # ── Public search API ──────────────────────────────────────
+        k1, b = 1.5, 0.75
+        scores: dict[str, float] = {}
+        for qw in qwords:
+            if qw not in self._bm25_idx:
+                continue
+            idf = math.log((self._bm25_N - len(self._bm25_idx[qw]) + 0.5)
+                          / (len(self._bm25_idx[qw]) + 0.5) + 1)
+            for cid, tf in self._bm25_idx[qw].items():
+                doc = self._bm25_docs.get(cid)
+                if not doc:
+                    continue
+                if filter_docs and doc.get('doc_filename', '') not in filter_docs:
+                    continue
+                dl = doc['word_count']
+                bm25_score = idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / self._bm25_avgdl))
+                scores[cid] = scores.get(cid, 0.0) + bm25_score
+
+        sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        return [{
+            'chunk_id': cid,
+            'text': self._bm25_docs[cid]['text'][:200],
+            'doc_filename': self._bm25_docs[cid]['doc_filename'],
+            'chapter_title': self._bm25_docs[cid]['chapter_title'],
+            'score': score, 'source': 'sparse',
+        } for cid, score in sorted_items]
 
     def search(self, query: str, top_k: int = 5, filter_docs: set[str] | None = None) -> list[dict]:
         """Returns dense results only (backward compat). For hybrid, use search_hybrid()."""
@@ -354,6 +452,5 @@ class DocumentVectorStore:
         self._all_texts = []
         self._all_metas = []
         self._content_hashes = set()
-        self._fts_conn.execute("DELETE FROM chunk_fts")
-        self._fts_conn.commit()
+        self._bm25_valid = False
         self._ensure_collection()

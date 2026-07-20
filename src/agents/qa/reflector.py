@@ -12,6 +12,7 @@ from ..base import BaseAgent, AgentInput, AgentOutput
 from ...config import Configuration
 from ...prompts.qa.router import SYSTEM_PROMPT
 from ...prompts.qa.reflector import REFLECT_PROMPT
+from ...context_builder import ReflectorContext, PromptBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -45,18 +46,31 @@ class Reflector(BaseAgent):
                 "reason": f"Review failed: {e}",
             })
 
-    async def review(self, question: str, answer: str, observations: str, history_ctx: str = "") -> dict:
+    async def review(self, question: str, answer: str, observations: str,
+                     history_ctx: str = "", reflector_ctx: ReflectorContext | None = None) -> dict:
         """Return structured verdict with gaps and suggested search queries."""
-        prompt = SYSTEM_PROMPT + "\n\n" + REFLECT_PROMPT.format(
+        system_prompt = SYSTEM_PROMPT + "\n\n" + REFLECT_PROMPT.format(
             question=question, answer=answer, observations=observations,
         )
-        if history_ctx:
-            prompt += f"\n\n{history_ctx}"
 
-        resp = await self._llm_retry([
-            SystemMessage(content=prompt),
-            HumanMessage(content="请判断回答是否充分。"),
-        ])
+        if reflector_ctx is not None:
+            messages = PromptBuilder.build(
+                system=system_prompt,
+                context=reflector_ctx,
+                user="请判断回答是否充分。",
+            )
+        elif history_ctx:
+            messages = [
+                SystemMessage(content=system_prompt + f"\n\n{history_ctx}"),
+                HumanMessage(content="请判断回答是否充分。"),
+            ]
+        else:
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content="请判断回答是否充分。"),
+            ]
+
+        resp = await self._llm_retry(messages)
         text = resp.content if hasattr(resp, "content") else str(resp)
         data = self._parse_json(text)
 
@@ -78,6 +92,7 @@ class Reflector(BaseAgent):
                 pass
         return {
             "verdict": "SUFFICIENT",
+            "insufficiency_type": "",
             "missing": [], "suggested_queries": [], "issues": [],
             "reason": "JSON parse failed, assuming sufficient",
         }

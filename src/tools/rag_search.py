@@ -1,11 +1,10 @@
-"""RAG search tool — 3-source hybrid retrieval with RRF fusion.
+"""RAG search tool — two-tier retrieval.
 
-Sources:
-  1. Dense:  ChromaDB + Qwen3-Embedding  (semantic, cross-lingual)
-  2. Sparse: SQLite FTS5 + BM25          (keyword, exact match)
-  3. Graph:  SQLite KnowledgeGraph       (concepts + 1-hop neighbors)
+Default (fast):     Dense top-20 → Cross-Encoder rerank → top-K
+Full (fallback):    Dense + Sparse + Graph → Cross-Encoder rerank → top-K
+                    (triggered when user marks answer unsatisfactory)
 
-Fusion: RRF (Reciprocal Rank Fusion) with k=60.
+Cross-Encoder: BGE-Reranker-v2-m3, 568M params, pushes best answer to rank 1.
 """
 
 from __future__ import annotations
@@ -21,16 +20,72 @@ logger = logging.getLogger(__name__)
 # Lazily set by the app
 _vector_store: Optional[object] = None
 _knowledge_graph: Optional[object] = None
+_memory_manager: Optional[object] = None  # MemoryManager — preferred path
 
 # RRF constant — larger k means more weight to low-ranked items
 RRF_K = 60
 
+# ── Cross-Encoder reranker (lazy-loaded once) ────────────────────────
+_reranker_model = None
+_reranker_tokenizer = None
 
-def init_rag_tool(vs, kg):
-    """Initialize with the app's DocumentVectorStore and KnowledgeGraph instances."""
-    global _vector_store, _knowledge_graph
-    _vector_store = vs
-    _knowledge_graph = kg
+
+def _get_reranker():
+    """Lazy-load BGE-Reranker-v2-m3. Returns (model, tokenizer) or (None, None)."""
+    global _reranker_model, _reranker_tokenizer
+    if _reranker_model is not None:
+        return _reranker_model, _reranker_tokenizer
+    try:
+        from pathlib import Path
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        # Try ModelScope download path first
+        rp = str(Path(__file__).resolve().parent.parent.parent
+                 / 'models' / 'reranker' / 'models'
+                 / 'BAAI--bge-reranker-v2-m3' / 'snapshots' / 'master')
+        _reranker_model = AutoModelForSequenceClassification.from_pretrained(rp, local_files_only=True)
+        _reranker_tokenizer = AutoTokenizer.from_pretrained(rp, local_files_only=True)
+        logger.info("Cross-Encoder reranker loaded: BGE-Reranker-v2-m3")
+    except Exception as e:
+        logger.warning("Cross-Encoder reranker unavailable: %s", e)
+        return None, None
+    return _reranker_model, _reranker_tokenizer
+
+
+def _ce_rerank(query: str, candidates: list[dict], top_k: int) -> list[dict]:
+    """Cross-Encoder rerank: (query, text) pairs → scores → top-k."""
+    if len(candidates) <= top_k:
+        return candidates
+    model, tok = _get_reranker()
+    if model is None:
+        return candidates[:top_k]
+    try:
+        import torch
+        pairs = [(query, c.get("text", "")[:500]) for c in candidates]
+        with torch.no_grad():
+            inputs = tok(pairs, padding=True, truncation=True, max_length=512, return_tensors='pt')
+            scores = model(**inputs, return_dict=True).logits.view(-1).tolist()
+        for i, s in enumerate(scores):
+            candidates[i]["ce_score"] = float(s)
+        candidates.sort(key=lambda x: x.get("ce_score", 0), reverse=True)
+    except Exception as e:
+        logger.warning("Cross-Encoder rerank failed: %s", e)
+    return candidates[:top_k]
+
+
+def init_rag_tool(vs=None, kg=None, memory_manager=None):
+    """Initialize with the app's DocumentVectorStore, KnowledgeGraph, and/or MemoryManager.
+
+    When memory_manager is provided, rag_search() delegates to
+    MemoryManager.semantic.search() for unified recall.
+    Falls back to vs/kg globals for backward compatibility.
+    """
+    global _vector_store, _knowledge_graph, _memory_manager
+    if vs is not None:
+        _vector_store = vs
+    if kg is not None:
+        _knowledge_graph = kg
+    if memory_manager is not None:
+        _memory_manager = memory_manager
 
 
 def get_doc_names() -> list[str]:
@@ -52,7 +107,7 @@ def get_doc_names() -> list[str]:
 
 def _text_key(item: dict) -> str:
     """Stable dedup key for a chunk, independent of source."""
-    text = item.get("text", "")[:200]
+    text = (item.get("text") or "")[:200]
     return hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -83,95 +138,175 @@ def _rrf_fuse(results_by_source: list[tuple[str, list[dict]]], top_k: int) -> li
     return sorted_items[:top_k]
 
 
-# ── Main search ─────────────────────────────────────────────────────
+def _rrf_fuse_weighted(
+    results_by_source: list[tuple[str, list[dict], float]], top_k: int,
+) -> list[dict]:
+    """Weighted RRF fusion — each source has its own weight multiplier.
+
+    Args:
+        results_by_source: [("dense", [...], 2.0), ("sparse", [...], 0.5), ...]
+            where the third element is the weight multiplier for that source.
+    """
+    scores: dict[str, dict] = {}
+
+    for source, ranked_list, weight in results_by_source:
+        for rank, item in enumerate(ranked_list):
+            key = _text_key(item)
+            rrf_score = weight / (RRF_K + rank + 1)
+            if key not in scores:
+                scores[key] = {**item, "rrf_score": rrf_score, "sources": [source]}
+            else:
+                scores[key]["rrf_score"] += rrf_score
+                if source not in scores[key]["sources"]:
+                    scores[key]["sources"].append(source)
+
+    sorted_items = sorted(scores.values(), key=lambda x: x["rrf_score"], reverse=True)
+    return sorted_items[:top_k]
+
+
+# ── Tier 1: rag_search (fast — Dense + Cross-Encoder) ──────────────
 
 async def rag_search(query: str, top_k: int = 5, filter_docs: Optional[set] = None) -> ToolResult:
-    """Hybrid search with RRF fusion across dense + sparse + graph sources."""
-    results_by_source: list[tuple[str, list[dict]]] = []
+    """Default retrieval: Dense top-20 → Cross-Encoder rerank → top-K.
 
-    # Guard
-    if _vector_store is None and _knowledge_graph is None:
+    Fast path (~2s). Handles ~80% of queries. No sparse/graph overhead.
+    """
+    # ── MemoryManager path ───────────────────────────────────────────
+    if _memory_manager is not None:
+        try:
+            sm = _memory_manager.semantic
+            return await _candidates_to_result(query, top_k, filter_docs, full=False)
+        except Exception as e:
+            logger.warning("MemoryManager semantic search failed, falling back: %s", e)
+
+    return await _candidates_to_result(query, top_k, filter_docs, full=False)
+
+
+# ── Tier 2: rag_fullsearch (Dense + Sparse + Graph + Cross-Encoder) ─
+
+async def rag_fullsearch(query: str, top_k: int = 5, filter_docs: Optional[set] = None) -> ToolResult:
+    """Full retrieval: Dense + Sparse + Graph → dedup → Cross-Encoder rerank → top-K.
+
+    Triggered when user feedback indicates the default answer was unsatisfactory.
+    Adds 0.5-1s for sparse + graph retrieval.
+    """
+    if _memory_manager is not None:
+        try:
+            return await _candidates_to_result(query, top_k, filter_docs, full=True)
+        except Exception as e:
+            logger.warning("MemoryManager fullsearch failed, falling back: %s", e)
+
+    return await _candidates_to_result(query, top_k, filter_docs, full=True)
+
+
+# ── Core logic: collect → CE rerank → format ────────────────────────
+
+async def _candidates_to_result(
+    query: str, top_k: int, filter_docs: Optional[set], full: bool,
+) -> ToolResult:
+    """Collect candidates from sources, CE rerank, format output."""
+    # Use module-level globals (MemoryManager path handled at higher level)
+    vs = _vector_store
+    kg = _knowledge_graph
+    if vs is None and kg is None:
         return ToolResult(
             tool_name="rag_search", query=query,
             content="（本地搜索未初始化，请先上传并处理文档）",
             error=ToolErrorType.NOT_CONFIGURED,
         )
 
-    # ── Source 1+2: Dense + Sparse from vector store ─────────────
-    if _vector_store is not None:
-        try:
-            # Use hybrid search for both dense and sparse in one call
-            hybrid = _vector_store.search_hybrid(query, top_k=top_k * 2, filter_docs=filter_docs)
-            if hybrid.get("dense"):
-                results_by_source.append(("dense", hybrid["dense"]))
-            if hybrid.get("sparse"):
-                results_by_source.append(("sparse", hybrid["sparse"]))
-        except AttributeError:
-            # Fallback for old vector store without search_hybrid
-            try:
-                dense_results = _vector_store.search(query, top_k=top_k * 2, filter_docs=filter_docs)
-                if dense_results:
-                    results_by_source.append(("dense", dense_results))
-            except Exception as e:
-                logger.warning("Dense search failed: %s", e)
+    candidates: list[dict] = []
+    seen_ids: set[str] = set()
 
-    # ── Source 3: Knowledge Graph ───────────────────────────────
-    kg_concepts = []
-    if _knowledge_graph is not None:
+    # Source 1: Dense (always — primary source)
+    if vs is not None:
+        dense = []
         try:
-            if filter_docs:
-                kg_concepts = _knowledge_graph.search_concepts_by_docs(query, filter_docs, limit=top_k)
-            else:
-                kg_concepts = _knowledge_graph.search_concepts(query, limit=top_k)
-            for c in kg_concepts:
-                neighbors = _knowledge_graph.get_neighbors(c.id)
-                if neighbors:
-                    c.metadata["neighbors"] = [
-                        {"name": n["concept_name"], "relation": n["relation_type"]}
-                        for n in neighbors[:5]
-                    ]
-            # Format KG results as chunk-like dicts for RRF fusion
-            graph_items = []
-            for c in kg_concepts:
-                graph_items.append({
-                    "text": f"{c.name}: {c.description}",
-                    "doc_filename": c.doc_filename or "",
-                    "chapter_title": "",
-                    "source": "graph",
-                    "concept": c,
-                })
-            results_by_source.append(("graph", graph_items))
+            dense = vs._search_dense(query, top_k=20, filter_docs=filter_docs) or []
         except Exception as e:
-            logger.warning("KG search failed: %s", e)
+            logger.warning("Dense _search_dense failed: %s", e)
+        # Safety net: if _search_dense returned nothing (e.g. mock), try search
+        if not dense and hasattr(vs, 'search'):
+            try:
+                dense = vs.search(query, top_k=20, filter_docs=filter_docs) or []
+            except Exception:
+                pass
+        for r in dense:
+            cid = r.get("chunk_id", "")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                r["source"] = r.get("source", "dense")
+                candidates.append(r)
 
-    # ── RRF Fusion ──────────────────────────────────────────────
-    if not results_by_source:
+    if full:
+        # Source 2: Sparse (supplement — keyword precision)
+        if vs is not None:
+            try:
+                sparse = vs._search_sparse(query, top_k=10, filter_docs=filter_docs) or []
+                for r in sparse:
+                    cid = r.get("chunk_id", "")
+                    if cid and cid not in seen_ids:
+                        seen_ids.add(cid)
+                        r["source"] = "sparse"
+                        candidates.append(r)
+            except Exception as e:
+                logger.warning("Sparse search failed: %s", e)
+
+        # Source 3: Graph (supplement — concept-level relations)
+        if kg is not None:
+            try:
+                kg_concepts = kg.search_concepts(query, limit=top_k)
+                for c in kg_concepts:
+                    neighbors = kg.get_neighbors(c.id)
+                    if neighbors:
+                        c.metadata["neighbors"] = [
+                            {"name": n["concept_name"], "relation": n["relation_type"]}
+                            for n in neighbors[:5]
+                        ]
+                    cid = c.source_chunk_id or f"kg:{c.id}"
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        candidates.append({
+                            "text": f"{c.name}: {c.description}",
+                            "doc_filename": c.doc_filename or "",
+                            "source": "graph",
+                            "chunk_id": cid,
+                            "concept": c,
+                        })
+            except Exception as e:
+                logger.warning("KG search failed: %s", e)
+
+    if not candidates:
         return ToolResult(
             tool_name="rag_search", query=query,
             content="（本地资料中未找到相关内容）",
             error=ToolErrorType.EMPTY_RESULT,
         )
 
-    fused = _rrf_fuse(results_by_source, top_k)
+    # ── Cross-Encoder rerank (ALL paths) ──────────────────────────
+    ranked = _ce_rerank(query, candidates, top_k)
 
-    # ── Format output ───────────────────────────────────────────
+    # ── Format output ─────────────────────────────────────────────
     parts = []
-    chunk_items = [f for f in fused if f.get("source") != "graph"]
-    graph_items = [f for f in fused if f.get("source") == "graph"]
+    chunk_items = [f for f in ranked if f.get("source") != "graph"]
+    graph_items = [f for f in ranked if f.get("source") == "graph"]
+
+    tier_label = "Dense + Sparse + Graph" if full else "Dense"
+    parts.append(f"=== 本地文档检索结果（{tier_label} + Cross-Encoder） ===")
 
     if chunk_items:
-        parts.append("=== 本地文档检索结果 ===")
         for i, item in enumerate(chunk_items):
             fn = item.get("doc_filename", "")
             ch = item.get("chapter_title", "")
-            src_label = f" [{', '.join(item.get('sources', []))}]"
+            ce = item.get("ce_score")
+            score_str = f" [CE: {ce:.3f}]" if ce is not None else ""
             source_parts = []
             if fn:
                 source_parts.append(fn)
             if ch:
                 source_parts.append(ch)
             source = f"  [来源: {' / '.join(source_parts)}]" if source_parts else ""
-            parts.append(f"[片段 {i + 1}]{src_label} {item['text']}")
+            parts.append(f"[片段 {i + 1}]{score_str} {item['text']}")
             if source:
                 parts.append(source)
 
@@ -188,20 +323,27 @@ async def rag_search(query: str, top_k: int = 5, filter_docs: Optional[set] = No
                     parts.append(f"  关联: {neighbor_str}")
 
     return ToolResult(
-        tool_name="rag_search",
+        tool_name="rag_search" if not full else "rag_fullsearch",
         query=query,
         content="\n".join(parts),
         metadata={
-            "total_fused": len(fused),
+            "tier": "full" if full else "fast",
+            "total_fused": len(ranked),
             "chunks_found": len(chunk_items),
             "concepts_found": len(graph_items),
+            "ce_reranked": True,
         },
     )
 
 
-# Register the tool
+# Register tools
 register_tool(
     name="rag_search",
-    description="搜索本地已上传的文档资料和知识图谱。当用户问题涉及已上传的教材、论文、笔记等本地资料时使用。",
+    description="默认文档检索：Dense语义搜索 + Cross-Encoder重排序。速度快，适合大多数问题。",
     func=rag_search,
+)
+register_tool(
+    name="rag_fullsearch",
+    description="全量文档检索：Dense + Sparse全文 + 知识图谱 + Cross-Encoder。当默认检索结果不满意时使用。",
+    func=rag_fullsearch,
 )

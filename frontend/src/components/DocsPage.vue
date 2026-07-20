@@ -84,6 +84,8 @@ async function detectChapters() {
   // Guard: don't start if this file is already detecting
   if (docs.detectingState[targetFile]?.detecting) return
 
+  // Normal detection: does NOT clear existing indexed data.
+  // Use '重新检测并清除' to wipe and re-detect.
   docs.chapters = []
   docs.startDetection(targetFile)
 
@@ -159,6 +161,14 @@ async function detectChapters() {
   if (docs.activeDoc === targetFile) {
     docs.loadProcessedLabels()
   }
+}
+
+async function detectChaptersWithClear() {
+  const targetFile = docs.activeDoc
+  if (!targetFile) return
+  if (docs.detectingState[targetFile]?.detecting) return
+  await docs.clearDocumentKnowledge(targetFile)
+  detectChapters()
 }
 
 function cancelDetection() {
@@ -264,6 +274,14 @@ async function processDocuments() {
               @click="detectChapters"
             >
               {{ docs.isDetecting ? '检测中...' : docs.hasChapterCache ? '重新分析章节' : '检测章节' }}
+            </button>
+            <button
+              class="btn-sm btn-danger"
+              :disabled="docs.isDetecting"
+              @click="detectChaptersWithClear"
+              title="清除本书已索引数据后重新检测"
+            >
+              🗑 清除并重检
             </button>
             <button
               v-if="docs.isDetecting"

@@ -25,11 +25,16 @@ _ctx: AppContext = init_context()
 
 # ── Re-export individual names for backward compat ─────────────────────
 
-config       = _ctx.config
-store        = _ctx.memory_store
-kg           = _ctx.knowledge_graph
-chapter_agent = _ctx.chapter_agent
-vs           = _ctx.vector_store
+config         = _ctx.config
+store          = _ctx.memory_store
+kg             = _ctx.knowledge_graph
+chapter_agent  = _ctx.chapter_agent
+vs             = _ctx.vector_store
+memory_manager = _ctx.memory_manager
+exact_cache    = _ctx.exact_cache
+gssc_pipeline  = _ctx.gssc_pipeline
+rag_skill      = _ctx.rag_skill
+supervisor     = _ctx.supervisor  # may be None if init failed
 
 chapters_cache: dict = _ctx.chapters_cache
 uploaded_files: dict[str, str] = _ctx.uploaded_files

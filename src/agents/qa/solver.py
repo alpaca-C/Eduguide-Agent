@@ -46,6 +46,8 @@ class DirectSolver(BaseAgent):
         self, question: str, doc_filter: set[str] | None, chat_history: list[dict] | None,
     ) -> dict:
         """Full pipeline: REWRITE → ACT → SYNTHESIZE."""
+        from src.harness import _agent_name
+        _agent_name.set("DirectSolver")
         observations: list[ToolResult] = []
         tool_call_log: list[dict] = []
 
@@ -65,17 +67,37 @@ class DirectSolver(BaseAgent):
             except Exception as e:
                 logger.warning("DirectSolver rag_search failed for '%s': %s", kw, e)
 
+        # ── EMPTY-RETRIEVAL GUARD ──────────────────────────────
+        # Filter out empty / not-configured / error results
+        valid_obs = [
+            o for o in observations
+            if o and not o.is_error and o.content.strip()
+            and "未找到相关内容" not in o.content
+            and "未初始化" not in o.content
+        ]
+        if not valid_obs:
+            logger.info(
+                "DirectSolver: all %d observations empty/invalid — refusing to synthesize",
+                len(observations),
+            )
+            return {
+                "reply": "抱歉，教材中未找到与您问题相关的内容。建议：\n1. 确认相关教材已上传并处理\n2. 尝试用更具体的术语重新提问\n3. 检查是否选对了教材章节",
+                "tool_calls": tool_call_log,
+                "observations": observations,
+                "route": "empty_result",
+            }
+
         # ── SYNTHESIZE ──────────────────────────────────────────
         obs_text = "\n\n".join(
-            f"[{o.tool_name}] {o.content}" for o in observations
-        ) if observations else "（未找到相关资料）"
+            f"[{o.tool_name}] {o.content}" for o in valid_obs
+        )
 
         try:
             synth_resp = await self._llm_retry([
                 SystemMessage(content=SYSTEM_PROMPT + "\n\n" + SYNTHESIS_PROMPT.format(
                     observations=obs_text, question=question,
                 )),
-                HumanMessage(content="请基于以上资料回答学生问题。"),
+                HumanMessage(content="请基于以上资料回答学生问题。如果资料不足以回答，请明确告知学生而不是编造内容。"),
             ])
             reply = synth_resp.content if hasattr(synth_resp, "content") else str(synth_resp)
         except Exception as e:
@@ -83,7 +105,7 @@ class DirectSolver(BaseAgent):
             reply = f"抱歉，回答生成失败: {e}"
 
         # Detect if result is insufficient → escalate
-        escalate = not observations and not reply.strip()
+        escalate = not reply.strip()
 
         return {
             "reply": reply,

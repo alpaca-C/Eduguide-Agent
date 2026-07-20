@@ -16,6 +16,12 @@
 
 from __future__ import annotations
 
+import os as _os
+_os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# PaddlePaddle 3.x ONEDNN bug workaround on Windows
+_os.environ.setdefault("FLAGS_use_onednn", "0")
+
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -23,6 +29,16 @@ from typing import Optional
 from .config import Configuration
 from .knowledge.graph import KnowledgeGraph
 from .memory.store import MemoryStore
+from .memory.short_term import ShortTermMemory
+from .memory.episodic import EpisodicMemory
+from .memory.semantic import SemanticMemory
+from .memory.manager import MemoryManager
+from .cache import ExactMatchCache
+from .context_builder import GSSCPipeline
+from .tools import get_tool_registry
+from .skills.rag_retrieval import RAGRetrievalSkill
+from .skills.problem_solve import ProblemSolveSkill
+from .supervisor import Supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +60,24 @@ class AppContext:
     config: Configuration
     memory_store: MemoryStore
     knowledge_graph: KnowledgeGraph
+
+    # Unified memory manager — short_term + episodic + semantic
+    memory_manager: MemoryManager = field(default=None, repr=False)
+
+    # Episodic memory (also accessible via memory_manager.episodic)
+    episodic_memory: EpisodicMemory = field(default=None, repr=False)
+
+    # Standalone cache (not part of memory — performance acceleration only)
+    exact_cache: ExactMatchCache = field(default=None, repr=False)
+
+    # GSSC context builder pipeline (Gather → Select → Structure → Compress)
+    gssc_pipeline: GSSCPipeline = field(default=None, repr=False)
+
+    # RAG retrieval skill (manages fast/full tier switching)
+    rag_skill: RAGRetrievalSkill = field(default=None, repr=False)
+
+    # Supervisor — thin dispatch layer above skills
+    supervisor: Supervisor = field(default=None, repr=False)
 
     # These are initialized lazily to avoid heavy imports at module load time
     chapter_agent: object = field(default=None, repr=False)
@@ -87,16 +121,79 @@ def init_context(
         knowledge_graph=kg,
     )
 
-    # Eager-init light objects
-    from .agents.chapterizer import ChapterizerAgent
-    ctx.chapter_agent = ChapterizerAgent(config)
+    # Eager-init light objects — skip in CI to avoid network calls
+    _in_ci = _os.environ.get("CI", "") or _os.environ.get("GITHUB_ACTIONS", "")
+    if not _in_ci:
+        try:
+            from .agents.chapterizer import ChapterizerAgent
+            ctx.chapter_agent = ChapterizerAgent(config)
+        except Exception as e:
+            logger.warning("ChapterizerAgent init failed: %s", e)
+            ctx.chapter_agent = None
+    else:
+        logger.info("CI environment detected, skipping ChapterizerAgent init")
+        ctx.chapter_agent = None
 
     from .agents.qa import DocumentVectorStore
     ctx.vector_store = DocumentVectorStore()
 
-    # Wire RAG tool to vector store + knowledge graph
+    # Wire RAG tool to vector store + knowledge graph (backward compat)
+    # Also pass MemoryManager for unified recall path
     from .tools.rag_search import init_rag_tool
-    init_rag_tool(ctx.vector_store, ctx.knowledge_graph)
+    init_rag_tool(vs=ctx.vector_store, kg=ctx.knowledge_graph)
+
+    # Build standalone exact-match cache (not part of memory)
+    ctx.exact_cache = ExactMatchCache(store)
+
+    # Build EpisodicMemory — cross-session experience recording + semantic recall
+    ctx.episodic_memory = EpisodicMemory()
+
+    # Build unified MemoryManager — short_term + episodic + semantic
+    ctx.memory_manager = MemoryManager(
+        short_term=ShortTermMemory(store),
+        episodic=ctx.episodic_memory,
+        semantic=SemanticMemory(ctx.vector_store, ctx.knowledge_graph),
+    )
+    logger.info("MemoryManager: short_term + episodic + semantic layers ready")
+
+    # Build GSSC context pipeline
+    ctx.gssc_pipeline = GSSCPipeline(
+        memory_manager=ctx.memory_manager,
+        tool_registry=get_tool_registry(),
+        token_budget=config.context_token_budget,
+        hard_limit=config.context_hard_limit,
+        relevance_weight=config.context_relevance_weight,
+        recency_weight=config.context_recency_weight,
+        min_score=config.context_min_score,
+    )
+    logger.info("GSSCPipeline: Gather→Select→Structure→Compress ready")
+
+    # Build RAG retrieval skill (manages fast/full tier switching)
+    ctx.rag_skill = RAGRetrievalSkill()
+    logger.info("RAGRetrievalSkill: Dense+CE (default) / Dense+Sparse+Graph+CE (full) ready")
+
+    # Build QASystem → wrap in ProblemSolveSkill → build Supervisor
+    # Skip in CI: tests mock their own QASystem instances
+    if not _in_ci:
+        try:
+            from .agents.qa.orchestrator import QASystem
+            qa_system = QASystem(config, gssc_pipeline=ctx.gssc_pipeline, rag_skill=ctx.rag_skill)
+            problem_solve = ProblemSolveSkill(qa_system)
+            ctx.supervisor = Supervisor(ctx.memory_manager, {"problem_solve": problem_solve})
+            logger.info("Supervisor: ready (1 skill registered: problem_solve)")
+        except Exception as e:
+            logger.error("Supervisor init failed (QA will be unavailable): %s", e)
+            ctx.supervisor = None
+    else:
+        logger.info("CI environment, skipping Supervisor init (tests mock it)")
+        ctx.supervisor = None
+
+    # Update RAG tool with MemoryManager (enables unified recall path)
+    init_rag_tool(memory_manager=ctx.memory_manager)
+
+    # Initialize harness hooks (logging, permissions, rate limits)
+    from .harness import init_hooks
+    init_hooks()
 
     _ctx = ctx
     logger.info("AppContext initialized successfully")

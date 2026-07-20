@@ -470,6 +470,54 @@ def _is_toc_region(text: str, pos: int, window: int = 400) -> bool:
     return len(chapter_markers) >= 3
 
 
+def _strip_toc_prefix(text: str, min_keep_chars: int = 200) -> str:
+    """Strip TOC / front-matter prefix from chapter text.
+
+    When page_range extracts pages that include the table of contents,
+    the TOC text appears before the actual chapter body. This function
+    detects the boundary where TOC ends and real content begins.
+
+    Detection: scan forward from the start. A position is considered
+    "still in TOC" if the surrounding 300-char window contains ≥4
+    chapter-like patterns (TOC pages have dense chapter listings).
+    The first position where the window density drops below threshold
+    is where real content starts.
+    """
+    if not text or len(text) < min_keep_chars:
+        return text
+
+    # TOC chapter pattern: 第X章, Chapter N, X.X.X section numbers
+    _toc_pattern = re.compile(
+        r'第[零〇一二三四五六七八九十百千\d]+[章童篇]'
+        r'|Chapter\s+\d+'
+        r'|\d+\.\d+(?:\.\d+)?\s+\S',  # section numbers like "1.1 xxx" or "9.4.2 xxx"
+    )
+
+    # Scan in steps of 100 chars, looking for TOC density drop
+    step = 100
+    window = 300
+
+    for scan_pos in range(0, len(text) - window, step):
+        ctx_start = max(0, scan_pos)
+        ctx_end = min(len(text), scan_pos + window)
+        ctx = text[ctx_start:ctx_end]
+        markers = _toc_pattern.findall(ctx)
+        # TOC pages have many chapter/section markers; real content has few
+        if len(markers) < 4:
+            # Found content start — cut from here
+            if scan_pos > 0:
+                stripped = text[scan_pos:].strip()
+                if len(stripped) >= min_keep_chars:
+                    logger.debug(
+                        "_strip_toc_prefix: found TOC boundary at pos %d "
+                        "(markers in window: %d)", scan_pos, len(markers),
+                    )
+                    return stripped
+            break
+
+    return text
+
+
 def _find_skip_toc(text: str, pattern: str, start: int = 0) -> int:
     """Find pattern in text, skipping matches that fall in TOC-dense regions."""
     pos = text.find(pattern, start)
@@ -583,6 +631,19 @@ def _split_by_meta(text: str, meta: list[dict]) -> list[ChapterInfo]:
             text=ch_text,
             text_length=len(ch_text),
         ))
+
+    # Strip TOC/front-matter prefix from first chapter.
+    # When page_range includes TOC pages before the actual chapter body,
+    # the TOC text gets assigned to the first chapter. This trims it.
+    if chapters:
+        orig_len = len(chapters[0].text)
+        chapters[0].text = _strip_toc_prefix(chapters[0].text)
+        chapters[0].text_length = len(chapters[0].text)
+        if orig_len != chapters[0].text_length:
+            logger.info(
+                "_split_by_meta: stripped TOC prefix from '%s' (%d → %d chars)",
+                chapters[0].title, orig_len, chapters[0].text_length,
+            )
 
     # Append title-only chapters for any that could not be located in text.
     # Common when: (a) TOC is in first 20 pages but chapter body headings

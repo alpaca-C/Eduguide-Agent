@@ -12,13 +12,16 @@ EXTRACTOR_SYSTEM_PROMPT = """你是一位知识图谱构建专家。你的任务
 ```json
 {
   "concepts": [
-    {"name": "概念名称", "description": "简洁描述", "category": "definition|theorem|method|example|concept"}
+    {"name": "概念名称", "description": "简洁描述", "category": "definition|theorem|method|example|concept", "source_fragment": 0}
   ],
   "relations": [
     {"source": "源概念名称", "target": "目标概念名称", "relation_type": "prerequisite_of|part_of|example_of|related_to|leads_to", "description": "关系简述"}
   ]
 }
 ```
+
+**字段说明：**
+- **source_fragment**：概念来自哪个片段编号（文本中 `[片段 N | ...]` 标记的 N）。如果概念来自多个片段，填主要的那个。如果无法确定，填 -1。
 
 **注意：**
 - 只提取文本中明确提到的概念，不要编造

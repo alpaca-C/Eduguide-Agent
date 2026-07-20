@@ -1,7 +1,7 @@
 # Unit tests for MemoryStore (SQLite + Qdrant hybrid memory)
 #
-# Tests focus on the SQLite layer. Qdrant paths require `_use_qdrant=True`,
-# which is only set when both qdrant_url and qdrant_api_key are provided.
+# Tests focus on the SQLite layer. Semantic caching (Qdrant) has been
+# moved to src/cache/semantic_cache.py and is tested separately.
 # Passing neither defaults to SQLite-only mode.
 
 from __future__ import annotations
@@ -386,10 +386,10 @@ class TestMemoryStoreInit:
             assert Path(expected).exists()
 
     def test_init_without_qdrant_does_not_use_qdrant(self):
-        """Without Qdrant credentials, _use_qdrant should be False."""
+        """MemoryStore initializes cleanly without Qdrant (SQLite-only)."""
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             store = MemoryStore(db_path=str(Path(tmpdir) / "test.db"))
-            assert store._use_qdrant is False
+            assert store._db_path  # Should have a valid SQLite path
 
     def test_init_creates_all_tables(self, store):
         """All expected tables should exist after init."""

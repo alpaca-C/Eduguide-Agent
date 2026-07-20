@@ -252,6 +252,8 @@ body {
 }
 .btn-sm:hover { background: var(--bg-hover); color: var(--text); }
 .btn-sm:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-danger { background: #fff5f5; color: #c0392b; border-color: #e0b4b4; }
+.btn-danger:hover { background: #ffe0e0; color: #a93226; }
 .btn-outline { background: transparent; }
 
 /* ===== Filter ===== */

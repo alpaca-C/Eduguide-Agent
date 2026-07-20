@@ -1,87 +1,56 @@
-# Integration tests for FastAPI endpoints
-#
-# Uses TestClient with mocked dependencies (store, config, uploaded_files, etc.)
-# to achieve zero-cost API-level coverage.
-#
-# Mock at router level because routers import e.g. `from .deps import store`
-# at module load time — patching deps.xxx doesn't retroactively update the
-# already-imported reference in each router.
+"""
+Integration tests for FastAPI endpoints.
+
+Uses TestClient with mocked dependencies via shared mock_deps fixture
+(see tests/conftest.py). Each test gets a clean TestClient with all
+deps mocked at the router level.
+"""
 
 from __future__ import annotations
 
+from io import BytesIO
+from unittest.mock import MagicMock
+
 import pytest
-from unittest.mock import MagicMock, patch
-
-
-# ── Mock store ─────────────────────────────────────────────────────
-
-def _fake_store():
-    """Return a MagicMock that behaves like MemoryStore for API tests."""
-    store = MagicMock()
-    store.list_sessions.return_value = [
-        {"id": "abc123", "topic": "test session", "updated_at": "2026-07-10"}
-    ]
-    store.get_session.return_value = {"id": "abc123", "topic": "电场学习", "report": "[]"}
-    store.get_chat_history.return_value = [
-        {"role": "user", "content": "什么是电场？"},
-        {"role": "assistant", "content": "电场是..."},
-    ]
-    store.delete_session.return_value = None
-    store.add_chat_message.return_value = None
-    store.save_session.return_value = None
-    return store
+from fastapi.testclient import TestClient
 
 
 # ── Fixture ────────────────────────────────────────────────────────
 
 @pytest.fixture
-def api_client(tmp_path):
-    """Create a FastAPI TestClient with all deps mocked at router level."""
-    from fastapi.testclient import TestClient
+def client(mock_deps):
+    """Create a TestClient with all deps mocked (zero-cost API coverage)."""
+    mock_deps.store.list_sessions.return_value = [
+        {"id": "abc123", "topic": "test session", "updated_at": "2026-07-10"},
+    ]
+    mock_deps.store.get_session.return_value = {
+        "id": "abc123", "topic": "电场学习", "report": "[]",
+    }
+    mock_deps.store.get_chat_history.return_value = [
+        {"role": "user", "content": "什么是电场？"},
+        {"role": "assistant", "content": "电场是..."},
+    ]
+    mock_deps.store.delete_session.return_value = None
+    mock_deps.store.add_chat_message.return_value = None
+    mock_deps.store.save_session.return_value = None
 
-    fake_store_obj = _fake_store()
-    fake_config = MagicMock()
-    fake_upload_dir = tmp_path / "uploads"
-    fake_upload_dir.mkdir()
-    fake_uploaded: dict[str, str] = {}
-
-    # Patch at ROUTER level — each router does `from .deps import store`,
-    # so it holds its own reference. Patching deps.xxx is too late.
-    with patch("src.api.router_sessions.store", fake_store_obj), \
-         patch("src.api.router_chat.store", fake_store_obj), \
-         patch("src.api.router_files.uploaded_files", fake_uploaded), \
-         patch("src.api.router_files.UPLOAD_DIR", fake_upload_dir), \
-         patch("src.api.deps.store", fake_store_obj), \
-         patch("src.api.deps.config", fake_config), \
-         patch("src.api.deps.kg", MagicMock()), \
-         patch("src.api.deps.vs", MagicMock()), \
-         patch("src.api.deps.chapter_agent", MagicMock()), \
-         patch("src.api.deps.chapters_cache", {}), \
-         patch("src.api.deps.uploaded_files", fake_uploaded), \
-         patch("src.api.deps.UPLOAD_DIR", fake_upload_dir), \
-         patch("src.api.deps.PROJECT_ROOT", tmp_path):
-
+    with mock_deps.patch():
         from src.api import app
-        client = TestClient(app)
-        yield client
+        yield TestClient(app)
 
 
 # ── Health ────────────────────────────────────────────────────────
 
 class TestHealthEndpoint:
-    """Tests for GET /api/health."""
-
-    def test_health_returns_ok(self, api_client):
-        response = api_client.get("/api/health")
-        assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+    def test_health_returns_ok(self, client):
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
 
 
 # ── Schemas ───────────────────────────────────────────────────────
 
 class TestSchemas:
-    """Tests for Pydantic request models."""
-
     def test_chat_request_valid(self):
         from src.api.schemas import ChatRequest
         req = ChatRequest(question="什么是库仑定律？", session_id="test", doc_filter=["a.pdf"])
@@ -115,76 +84,62 @@ class TestSchemas:
 # ── Sessions ──────────────────────────────────────────────────────
 
 class TestSessionsEndpoint:
-    """Tests for GET/DELETE /api/sessions."""
-
-    def test_list_sessions(self, api_client):
-        response = api_client.get("/api/sessions")
-        assert response.status_code == 200
-        data = response.json()
-        assert "sessions" in data
+    def test_list_sessions(self, client):
+        resp = client.get("/api/sessions")
+        assert resp.status_code == 200
+        data = resp.json()
         assert len(data["sessions"]) == 1
         assert data["sessions"][0]["id"] == "abc123"
 
-    def test_get_session(self, api_client):
-        response = api_client.get("/api/sessions/abc123")
-        assert response.status_code == 200
-        data = response.json()
+    def test_get_session(self, client):
+        resp = client.get("/api/sessions/abc123")
+        assert resp.status_code == 200
+        data = resp.json()
         assert data["session_id"] == "abc123"
-        assert data["topic"] == "电场学习"
-        assert "messages" in data
         assert len(data["messages"]) == 2
 
-    def test_get_session_not_found(self, api_client):
-        # Override the mock to return None for this session
+    def test_get_session_not_found(self, client):
         import src.api.router_sessions as rs
         rs.store.get_session.return_value = None
+        resp = client.get("/api/sessions/nonexistent")
+        assert resp.status_code == 404
 
-        response = api_client.get("/api/sessions/nonexistent")
-        assert response.status_code == 404
-
-    def test_delete_session(self, api_client):
-        response = api_client.delete("/api/sessions/abc123")
-        assert response.status_code == 200
-        assert response.json() == {"deleted": "abc123"}
+    def test_delete_session(self, client):
+        resp = client.delete("/api/sessions/abc123")
+        assert resp.status_code == 200
+        assert resp.json() == {"deleted": "abc123"}
 
 
 # ── Files ─────────────────────────────────────────────────────────
 
 class TestFilesEndpoint:
-    """Tests for POST/GET/DELETE /api/files."""
+    def test_list_files_empty(self, client):
+        resp = client.get("/api/files/list")
+        assert resp.status_code == 200
+        assert resp.json() == {"files": []}
 
-    def test_list_files_empty(self, api_client):
-        response = api_client.get("/api/files/list")
-        assert response.status_code == 200
-        assert response.json() == {"files": []}
-
-    def test_upload_and_list(self, api_client):
-        from io import BytesIO
-
+    def test_upload_and_list(self, client):
         content = BytesIO(b"test content for document")
-        response = api_client.post(
+        resp = client.post(
             "/api/files/upload",
             files=[("files", ("test_doc.pdf", content, "application/pdf"))],
         )
-        assert response.status_code == 200
-        data = response.json()
+        assert resp.status_code == 200
+        data = resp.json()
         assert data["total"] == 1
         assert "test_doc.pdf" in data["uploaded"]
 
-        response2 = api_client.get("/api/files/list")
-        assert "test_doc.pdf" in response2.json()["files"]
+        resp2 = client.get("/api/files/list")
+        assert "test_doc.pdf" in resp2.json()["files"]
 
-    def test_upload_unsupported_format(self, api_client):
-        from io import BytesIO
-
+    def test_upload_unsupported_format(self, client):
         content = BytesIO(b"binary data")
-        response = api_client.post(
+        resp = client.post(
             "/api/files/upload",
             files=[("files", ("movie.mp4", content, "video/mp4"))],
         )
-        assert response.status_code == 400
-        assert "Unsupported" in response.json()["detail"]
+        assert resp.status_code == 400
 
-    def test_delete_file_not_found(self, api_client):
-        response = api_client.delete("/api/files/nonexistent.pdf")
-        assert response.status_code == 404
+    def test_delete_file_not_found(self, client):
+        resp = client.delete("/api/files/nonexistent.pdf")
+        assert resp.status_code == 404

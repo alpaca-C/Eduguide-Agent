@@ -19,6 +19,7 @@ const thinking = ref('')
 const sending = ref(false)
 const chatContainer = ref(null)
 const docFilter = ref([])
+const tutorMode = ref(false)
 
 onMounted(() => {
   chat.refreshSessions()
@@ -61,6 +62,7 @@ async function sendMessage() {
         question,
         session_id: chat.sessionId,
         doc_filter: docFilter.value,
+        tutor_mode: tutorMode.value,
       }),
     })
 
@@ -170,14 +172,83 @@ function onKeydown(e) {
       </div>
 
       <div class="chat-input-area">
-        <textarea
-          v-model="input"
-          placeholder="基于上传的资料提问..."
-          rows="2"
-          @keydown="onKeydown"
-        />
-        <button class="btn-primary" @click="sendMessage" :disabled="sending">发送</button>
+        <div class="input-row">
+          <textarea
+            v-model="input"
+            placeholder="基于上传的资料提问..."
+            rows="2"
+            @keydown="onKeydown"
+          />
+        </div>
+        <div class="input-actions">
+          <label class="tutor-toggle" :class="{ active: tutorMode }">
+            <input type="checkbox" v-model="tutorMode" />
+            <span class="toggle-label">📝 举一反三</span>
+            <span class="toggle-hint">引导式习题讲解</span>
+          </label>
+          <button class="btn-primary" @click="sendMessage" :disabled="sending">
+            {{ tutorMode ? '开始引导' : '发送' }}
+          </button>
+        </div>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+/* Override parent's horizontal flex to vertical layout for input-row + input-actions */
+.chat-input-area {
+  flex-direction: column;
+}
+.input-row {
+  width: 100%;
+}
+.input-row textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #d0d5dd);
+  border-radius: 8px;
+  font-size: 14px;
+  resize: vertical;
+  min-height: 48px;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+.input-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.tutor-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color, #d0d5dd);
+  font-size: 13px;
+  user-select: none;
+  transition: all 0.2s;
+  background: var(--bg-secondary, #f8f9fa);
+}
+.tutor-toggle.active {
+  background: #e8f4fd;
+  border-color: #3b82f6;
+  color: #2563eb;
+}
+.tutor-toggle input[type="checkbox"] {
+  display: none;
+}
+.toggle-label {
+  white-space: nowrap;
+}
+.toggle-hint {
+  color: var(--text-muted, #999);
+  font-size: 11px;
+}
+.tutor-toggle.active .toggle-hint {
+  color: #3b82f6;
+}
+</style>

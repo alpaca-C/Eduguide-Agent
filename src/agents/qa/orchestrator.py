@@ -15,6 +15,7 @@ import logging
 
 from ...config import Configuration
 from ...tools import ToolResult
+from ...context_builder import ContextRouter, RouterContext, PlannerContext, SolverContext, ReflectorContext
 
 from .router import QuestionRouter
 from .solver import DirectSolver
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 MAX_COMPLEX_ROUNDS = 3
 MAX_MODERATE_ROUNDS = 2
+MAX_INLINE_FIXES = 2      # Max inline knowledge/reasoning fixes per complex round
 MAX_HISTORY_CHARS = 4000  # Max chars of chat_history to inject into prompts
 COMPRESS_THRESHOLD = 12   # Messages before compressing older ones into summary
 MAX_OBS_CHARS = 6000      # Max chars of accumulated observations
@@ -34,15 +36,16 @@ MAX_OBS_CHARS = 6000      # Max chars of accumulated observations
 class QASystem:
     """Orchestrates the 5-agent QA pipeline with 3-tier difficulty routing."""
 
-    def __init__(self, config: Configuration):
+    def __init__(self, config: Configuration, gssc_pipeline=None, rag_skill=None):
         self._config = config
         self._router = QuestionRouter(config)
         self._solver = DirectSolver(config)
         self._planner = Planner(config)
         self._executor = Executor(config)
         self._reflector = Reflector(config)
-        # Separate LLM for history compression (cheap, fast)
-        self._compress_llm = None
+        self._gssc = gssc_pipeline  # GSSC context builder (optional)
+        self._ctx_router = ContextRouter()  # typed context builder
+        self._rag_skill = rag_skill  # RAG retrieval skill (optional)
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -50,14 +53,28 @@ class QASystem:
         self, question: str,
         doc_filter: set[str] | None = None,
         chat_history: list[dict] | None = None,
+        memory_context: object = None,  # MemoryContext from MemoryManager.recall()
+        tutor_mode: bool = False,
     ) -> dict:
         """Main entry point. Returns {reply, rounds, tool_calls, route}."""
-        # Compress history for injection into prompts
-        history_ctx = self._build_history_context(chat_history)
+        # ── "举一反三" exercise tutor mode ──
+        if tutor_mode:
+            return await self._handle_tutor(question, doc_filter, chat_history)
 
-        # Tier 0: Classify difficulty (with conversation context)
+        # Build RouterContext via ContextRouter
+        router_ctx = self._ctx_router.build_router(question, memory_context)
+
+        # Build legacy history_ctx for fallback/compat
+        if memory_context is not None and hasattr(memory_context, 'history_context'):
+            history_ctx = memory_context.history_context
+        else:
+            history_ctx = self._build_history_context(chat_history)
+
+        # Tier 0: Classify difficulty (with typed context)
         route_result = await self._router.run(self._mk_input(
-            question=question, chat_history=history_ctx,
+            question=question,
+            chat_history=history_ctx,         # legacy compat
+            router_context=router_ctx,         # typed context
         ))
         difficulty = route_result.metadata.get("difficulty", "moderate")
 
@@ -72,11 +89,14 @@ class QASystem:
         # Moderate: DirectSolver
         if difficulty == "moderate":
             return await self._handle_moderate(question, doc_filter, chat_history,
-                                               seed_decomposition=seed_decomposition)
+                                               seed_decomposition=seed_decomposition,
+                                               history_ctx=history_ctx)
 
         # Complex: Planner pipeline
         return await self._handle_complex(question, doc_filter, chat_history,
-                                          seed_decomposition=seed_decomposition)
+                                          seed_decomposition=seed_decomposition,
+                                          history_ctx=history_ctx,
+                                          memory_context=memory_context)
 
     # ── History context builder ────────────────────────────────────
 
@@ -139,6 +159,7 @@ class QASystem:
         self, question: str, doc_filter: set[str] | None,
         chat_history: list[dict] | None,
         seed_decomposition: list[str] | None = None,
+        history_ctx: str = "",
     ) -> dict:
         """DirectSolver with up to MAX_MODERATE_ROUNDS retry on escalation."""
         tool_call_log: list[dict] = []
@@ -159,7 +180,8 @@ class QASystem:
             logger.info("[QA] moderate escalated to complex at round %d", round_num)
             break
 
-        return await self._handle_complex(question, doc_filter, chat_history, seed_decomposition)
+        return await self._handle_complex(question, doc_filter, chat_history,
+                                          seed_decomposition)
 
     # ── Complex path ──────────────────────────────────────────────
 
@@ -167,14 +189,18 @@ class QASystem:
         self, question: str, doc_filter: set[str] | None,
         chat_history: list[dict] | None,
         seed_decomposition: list[str] | None = None,
+        history_ctx: str = "",
+        memory_context=None,
     ) -> dict:
         """Planner → Executor → Reflector loop with conversation context.
 
         Args:
             seed_decomposition: Optional initial sub-questions from Router.
-                Passed to Planner to seed decomposition (avoids re-deriving from scratch).
+            history_ctx: Pre-computed context (legacy path).
+            memory_context: MemoryContext from MemoryManager.recall().
         """
-        history_ctx = self._build_history_context(chat_history)
+        if not history_ctx:
+            history_ctx = self._build_history_context(chat_history)
         tool_call_log: list[dict] = []
         feedback = ""
         last_answer = ""
@@ -183,11 +209,18 @@ class QASystem:
         for round_num in range(1, MAX_COMPLEX_ROUNDS + 1):
             logger.info("[QA] complex round %d/%d", round_num, MAX_COMPLEX_ROUNDS)
 
-            # ── PLAN (with history + feedback + router seed) ─────
+            # ── PLAN (with typed PlannerContext) ─────
+            planner_ctx = self._ctx_router.build_planner(
+                question, memory_context,
+                seed_decomposition=seed_decomposition,
+                feedback=feedback,
+                current_round=round_num,
+            )
             plan = await self._planner.plan(
                 question, feedback=feedback,
                 history_ctx=history_ctx,
                 seed_decomposition=seed_decomposition,
+                planner_ctx=planner_ctx,
             )
             if not plan:
                 logger.warning("[QA] planner returned empty plan at round %d", round_num)
@@ -226,40 +259,232 @@ class QASystem:
             if len(all_obs_text) > MAX_OBS_CHARS:
                 all_obs_text = "...（早期搜索结果已截断）\n" + all_obs_text[-MAX_OBS_CHARS:]
 
-            # ── SOLVE (with history context) ─────────────────────
-            answer = await self._planner.solve(question, obs_text, history_ctx=history_ctx)
+            # ── Build solver context for this round ─────────────
+            solver_ctx = self._ctx_router.build_solver(
+                question, plan=plan, search_results=exec_results,
+            )
+
+            # ── SOLVE ────────────────────────────────────────────
+            answer = await self._planner.solve(
+                question, obs_text, history_ctx=history_ctx,
+                solver_ctx=solver_ctx,
+            )
             last_answer = answer
 
-            # ── REFLECT ──────────────────────────────────────────
+            # ── REFLECT (with inline fix loop) ───────────────────
             if round_num < MAX_COMPLEX_ROUNDS:
-                verdict = await self._reflector.review(
-                    question, answer, obs_text,
-                    history_ctx=history_ctx,
-                )
-                if verdict.get("verdict") == "SUFFICIENT":
-                    logger.info("[QA] reflector: SUFFICIENT at round %d", round_num)
-                    return {"reply": answer, "rounds": round_num, "tool_calls": tool_call_log, "route": "complex"}
+                for fix_round in range(MAX_INLINE_FIXES + 1):
+                    # Build fresh reflector context with current answer
+                    reflector_ctx = self._ctx_router.build_reflector(
+                        question, answer=answer, observations=obs_text,
+                    )
+                    verdict = await self._reflector.review(
+                        question, answer, obs_text,
+                        history_ctx=history_ctx,
+                        reflector_ctx=reflector_ctx,
+                    )
+                    if verdict.get("verdict") == "SUFFICIENT":
+                        logger.info("[QA] reflector: SUFFICIENT at round %d (fix=%d)",
+                                     round_num, fix_round)
+                        return {"reply": answer, "rounds": round_num,
+                                "tool_calls": tool_call_log, "route": "complex"}
 
-                # Build structured feedback for next planner iteration
-                missing = verdict.get("missing", [])
-                queries = verdict.get("suggested_queries", [])
-                issues = verdict.get("issues", [])
-                fb_parts = []
-                if missing:
-                    fb_parts.append(f"缺失知识点：{'；'.join(missing)}")
-                if queries:
-                    fb_parts.append(f"建议搜索查询：{'；'.join(queries)}")
-                if issues:
-                    fb_parts.append(f"回答问题：{'；'.join(issues)}")
-                feedback = "。".join(fb_parts)
-                logger.info("[QA] reflector INSUFFICIENT: %s", feedback[:200])
+                    ins_type = verdict.get("insufficiency_type", "plan")
+                    logger.info("[QA] reflector INSUFFICIENT: type=%s round=%d fix=%d/%d",
+                                 ins_type, round_num, fix_round, MAX_INLINE_FIXES)
 
-        return {"reply": last_answer, "rounds": MAX_COMPLEX_ROUNDS, "tool_calls": tool_call_log, "route": "complex"}
+                    # ── Plan type or fix exhausted → full re-plan next round ──
+                    if ins_type == "plan" or fix_round >= MAX_INLINE_FIXES:
+                        if self._rag_skill is not None:
+                            self._rag_skill.mark_unsatisfied(question)
+                        feedback = self._build_feedback(verdict)
+                        logger.info("[QA] feedback → next planner round: %s", feedback[:200])
+                        break  # exit inner loop → next main round
+
+                    # ── Knowledge type → re-execute with better queries ──
+                    if ins_type == "knowledge":
+                        queries = verdict.get("suggested_queries", [])
+                        if not queries:
+                            # No queries to search → fallback to plan
+                            logger.info("[QA] knowledge type but no queries → fallback to plan")
+                            if self._rag_skill is not None:
+                                self._rag_skill.mark_unsatisfied(question)
+                            feedback = self._build_feedback(verdict)
+                            break
+
+                        # Escalate search tier for these queries
+                        if self._rag_skill is not None:
+                            for q in queries:
+                                self._rag_skill.mark_unsatisfied(q)
+
+                        # Build mini-plan from suggested queries and execute
+                        mini_plan = self._queries_to_plan(queries)
+                        new_results = await self._executor.execute(mini_plan, doc_filter)
+                        for sub_result in new_results:
+                            for r in sub_result.get("results", []):
+                                if hasattr(r, "tool_name"):
+                                    tool_call_log.append({
+                                        "sub_id": sub_result.get("id"),
+                                        "tool": r.tool_name, "query": r.query,
+                                    })
+
+                        # Accumulate new observations
+                        new_parts = []
+                        for sub in new_results:
+                            new_parts.append(
+                                f"\n### 补搜 {sub.get('id')}: {sub.get('question')}"
+                            )
+                            for r in sub.get("results", []):
+                                new_parts.append(f"[{r.tool_name}] {r.content[:600]}")
+                        new_obs = "\n".join(new_parts)
+                        all_obs_text = (
+                            all_obs_text[-MAX_OBS_CHARS // 2:]
+                            + "\n---\n" + new_obs
+                        )
+                        if len(all_obs_text) > MAX_OBS_CHARS:
+                            all_obs_text = (
+                                "...（早期搜索结果已截断）\n"
+                                + all_obs_text[-MAX_OBS_CHARS:]
+                            )
+
+                        # Re-solve with accumulated observations
+                        solver_ctx = self._ctx_router.build_solver(
+                            question, plan=plan, search_results=exec_results,
+                        )
+                        answer = await self._planner.solve(
+                            question, all_obs_text, history_ctx=history_ctx,
+                            solver_ctx=solver_ctx,
+                        )
+                        last_answer = answer
+                        continue  # re-reflect in inner loop
+
+                    # ── Reasoning type → re-solve only ────────────
+                    if ins_type == "reasoning":
+                        issues = verdict.get("issues", [])
+                        fb = (
+                            "；".join(issues)
+                            if issues
+                            else "请修正综合推理逻辑，更充分地利用搜索资料中的信息。"
+                        )
+                        solver_ctx = self._ctx_router.build_solver(
+                            question, plan=plan, search_results=exec_results,
+                        )
+                        answer = await self._planner.solve(
+                            question, all_obs_text, history_ctx=history_ctx,
+                            solver_ctx=solver_ctx,
+                            reasoning_feedback=fb,
+                        )
+                        last_answer = answer
+                        continue  # re-reflect in inner loop
+
+        return {"reply": last_answer, "rounds": MAX_COMPLEX_ROUNDS,
+                "tool_calls": tool_call_log, "route": "complex"}
+
+    # ── Exercise Tutor path ────────────────────────────────────────
+
+    async def _handle_tutor(
+        self, question: str, doc_filter: set[str] | None,
+        chat_history: list[dict] | None,
+    ) -> dict:
+        """Socratic exercise tutor: search → guided response (no direct answer).
+
+        Loads the "exercise_tutor" skill prompt, runs rag_search to retrieve
+        relevant textbook knowledge, then generates a Socratic-style guided
+        response that leads the student to discover the answer themselves.
+        """
+        import src.skills.exercise_tutor  # noqa: F401 — trigger register_skill()
+        from src.skills import get_skill
+        skill = get_skill("exercise_tutor")
+        if skill is None:
+            return {"reply": "举一反三功能未初始化，请检查 skills 配置。",
+                    "rounds": 0, "tool_calls": [], "route": "error"}
+
+        # Phase 1: Retrieve relevant knowledge from textbooks
+        observations_text = ""
+        tool_call_log: list[dict] = []
+
+        if "rag_search" in skill.tools:
+            try:
+                result = await self._solver.run(self._mk_input(
+                    question=question, doc_filter=doc_filter,
+                    chat_history=chat_history,
+                ))
+                if result.success:
+                    meta = result.metadata
+                    for obs in meta.get("observations", []):
+                        if hasattr(obs, "content"):
+                            observations_text += obs.content + "\n\n"
+                    tool_call_log = meta.get("tool_calls", [])
+            except Exception as e:
+                logger.warning("Exercise tutor search failed: %s", e)
+                observations_text = "（暂时无法检索教材内容，请直接引导）"
+
+        if not observations_text.strip():
+            observations_text = "（未找到相关教材内容，请基于通用知识引导）"
+
+        # Phase 2: Generate Socratic guided response
+        history_ctx = self._build_history_context(chat_history)
+        prompt = skill.system_prompt.format(
+            question=question,
+            observations=observations_text,
+            chat_history=history_ctx or "（新对话）",
+        )
+
+        try:
+            llm = self._solver._make_llm(temperature=0.3)   # Slight warmth for natural tutoring
+            from langchain_core.messages import HumanMessage, SystemMessage
+            resp = await llm.ainvoke([
+                SystemMessage(content=prompt),
+                HumanMessage(content="请开始引导学生。"),
+            ])
+            reply = resp.content if hasattr(resp, "content") else str(resp)
+        except Exception as e:
+            logger.error("Exercise tutor LLM failed: %s", e)
+            reply = f"抱歉，生成引导式回答时出错: {e}"
+
+        return {"reply": reply, "rounds": 1, "tool_calls": tool_call_log, "route": "tutor"}
 
     @staticmethod
     def _mk_input(**metadata) -> object:
         from ..base import AgentInput
         return AgentInput(metadata=metadata)
+
+    # ── Inline fix helpers ────────────────────────────────────────
+
+    @staticmethod
+    def _queries_to_plan(queries: list[str]) -> list[dict]:
+        """Convert suggested search queries into a mini-plan for Executor.
+
+        Each query becomes a standalone sub-question with no dependencies,
+        using rag_search as the tool.
+        """
+        if not queries:
+            return []
+        return [
+            {
+                "id": 900 + i,
+                "question": q,
+                "keywords": [q],
+                "tool": "rag_search",
+                "depends_on": [],
+            }
+            for i, q in enumerate(queries[:5])  # cap at 5 queries
+        ]
+
+    @staticmethod
+    def _build_feedback(verdict: dict) -> str:
+        """Build structured feedback string from Reflector verdict."""
+        missing = verdict.get("missing", [])
+        queries = verdict.get("suggested_queries", [])
+        issues = verdict.get("issues", [])
+        fb_parts = []
+        if missing:
+            fb_parts.append(f"缺失知识点：{'；'.join(missing)}")
+        if queries:
+            fb_parts.append(f"建议搜索查询：{'；'.join(queries)}")
+        if issues:
+            fb_parts.append(f"回答问题：{'；'.join(issues)}")
+        return "。".join(fb_parts)
 
 
 # ===========================================================================
@@ -269,11 +494,11 @@ class QASystem:
 _agent: QASystem | None = None
 
 
-def get_agent(config: Configuration) -> QASystem:
+def get_agent(config: Configuration, gssc_pipeline=None, rag_skill=None) -> QASystem:
     """Get or create the QASystem singleton."""
     global _agent
     if _agent is None:
-        _agent = QASystem(config)
+        _agent = QASystem(config, gssc_pipeline=gssc_pipeline, rag_skill=rag_skill)
     return _agent
 
 

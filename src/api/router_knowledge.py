@@ -80,10 +80,14 @@ async def process_knowledge(req: ProcessRequest):
         # ── Step 1: Full parse + split ──
         documents: list[Document] = []
         chapter_map: dict[str, str] = {}
+        processed_files: set[str] = set()
+        processed_chapters: dict[str, list[str]] = {}  # fname → [chapter_titles]
         total_files = len(file_chapters)
 
         for idx, (full_path, chap_infos) in enumerate(file_chapters.items()):
             fname = Path(full_path).name
+            processed_files.add(fname)
+            processed_chapters[fname] = [ci.get("title", "") for ci in chap_infos]
             yield _sse({
                 "type": "progress",
                 "stage": f"解析: {fname}",
@@ -92,20 +96,31 @@ async def process_knowledge(req: ProcessRequest):
             await asyncio.sleep(0.1)
 
             # Resolve page range (required for image PDF targeted OCR).
+            # Apply toc_offset to correct for cover/copyright/preface/TOC pages.
             _page_range: tuple[int, int] | None = None
+            _toc_offset = 0
             if chap_infos:
                 _ci = chap_infos[0]
                 _info = chapters_cache.get(_ci["label"], {})
                 _sp = _info.get("start_page", 0)
                 _ep = _info.get("end_page", 0)
+                _toc_offset = _info.get("toc_offset", 0)
                 if _sp <= 0 or _ep <= 0:
                     _saved = _load_chapters(fname)
                     for _sc in _saved:
                         if _sc.get("title") == _ci.get("title"):
                             _sp = _sc.get("start_page", 0)
                             _ep = _sc.get("end_page", 0)
+                            _toc_offset = _toc_offset or _sc.get("toc_offset", 0)
                             break
                 if _sp > 0 and _ep > 0 and _ep >= _sp:
+                    if _toc_offset:
+                        _sp += _toc_offset
+                        _ep += _toc_offset
+                        logger.info(
+                            "[API KNOWLEDGE] %s | toc_offset=%d applied -> "
+                            "page_range=(%d, %d)", fname, _toc_offset, _sp, _ep,
+                        )
                     _page_range = (_sp, _ep)
                 else:
                     yield _sse({
@@ -124,7 +139,6 @@ async def process_knowledge(req: ProcessRequest):
                 # OCR'd exactly the right pages.
                 if full_doc.content.strip():
                     for ci in chap_infos:
-                        # Prepend chapter/section header so chunks carry citation info
                         _header = f"《{fname}》{ci['title']}\n\n"
                         documents.append(Document(
                             filename=fname, content=_header + full_doc.content,
@@ -228,9 +242,34 @@ async def process_knowledge(req: ProcessRequest):
         })
         await asyncio.sleep(0.1)
 
-        # ── Step 4: Extract Knowledge Graph ──
-        kg.clear()
-        result = await asyncio.to_thread(extract_full_document, all_chunks, config, kg)
+        # ── Step 4: Extract Knowledge Graph (incremental) ──
+        # Only extract from NEW chunks (not previously indexed).
+        # Old concepts are preserved — no deletion needed.
+        new_chunks = []
+        vs_content_hashes = getattr(vs, '_content_hashes', set())
+        for ch in all_chunks:
+            h = vs._text_hash(ch.text[:2000]) if hasattr(vs, '_text_hash') else hash(ch.text[:500])
+            if h not in vs_content_hashes:
+                new_chunks.append(ch)
+        skipped = len(all_chunks) - len(new_chunks)
+        if skipped > 0:
+            yield _sse({"type": "progress", "stage": f"跳过{skipped}个已有chunk, 提取{len(new_chunks)}个新chunk...", "pct": 66})
+            await asyncio.sleep(0.1)
+
+        if new_chunks:
+            result = await asyncio.to_thread(extract_full_document, new_chunks, config, kg)
+            # Cross-chapter linking: connect new concepts to existing
+            try:
+                from src.config import Configuration as _Cfg
+                _cfg = _Cfg.from_env()
+                from langchain_openai import ChatOpenAI
+                _llm = ChatOpenAI(model=_cfg.llm_model_id, api_key=_cfg.llm_api_key,
+                                  base_url=_cfg.llm_base_url, temperature=0.0, max_tokens=500)
+                kg.link_cross_chapter(embedding_fn=vs._ef, llm=_llm)
+            except Exception as e:
+                logger.warning("Cross-chapter linking skipped: %s", e)
+        else:
+            result = {"concepts_extracted": 0, "relations_extracted": 0}
         stats = kg.stats()
 
         yield _sse({
@@ -296,8 +335,8 @@ async def delete_chapter(label: str):
     # Remove from vector store (ChromaDB + FTS5)
     vs_removed = vs.remove_by_chapter(doc_filename, chapter_title) if vs else 0
 
-    # Remove from KG (concepts for this document)
-    kg_removed = kg.remove_by_doc(doc_filename) if kg else 0
+    # Remove from KG (concepts for this specific chapter)
+    kg_removed = kg.remove_by_chapter(doc_filename, chapter_title) if kg else 0
 
     # Clean up cached state
     from .deps import chapters_cache as cc
@@ -312,6 +351,50 @@ async def delete_chapter(label: str):
         "status": "deleted",
         "label": label,
         "chunks_removed": vs_removed,
+        "concepts_removed": kg_removed,
+    }
+
+
+@router.delete("/documents/{filename}")
+async def delete_document_knowledge(filename: str):
+    """Remove all chunks and KG data for a specific document.
+
+    Used when re-detecting chapters — clears previous import state
+    so the user starts fresh for this document only.
+    """
+    from urllib.parse import unquote
+    filename = unquote(filename)
+
+    # Remove from vector store (ChromaDB + FTS5)
+    vs_removed = 0
+    if vs:
+        vs.remove_document(filename)
+        # Count removed from FTS
+        try:
+            cursor = vs._fts_conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM chunk_fts WHERE doc_filename = ?", (filename,))
+            remaining = cursor.fetchone()[0]
+            vs_removed = "cleared"
+        except Exception:
+            vs_removed = "cleared"
+
+    # Remove from KG
+    kg_removed = kg.remove_by_doc(filename) if kg else 0
+
+    # Clean up cached chapters
+    from .deps import chapters_cache as cc
+    labels_to_remove = [l for l in cc if cc[l].get("filename") == filename]
+    for l in labels_to_remove:
+        del cc[l]
+
+    logger.info(
+        "[API KNOWLEDGE] deleted document '%s': vs=%s, kg=%d concepts",
+        filename, vs_removed, kg_removed,
+    )
+    return {
+        "status": "deleted",
+        "filename": filename,
+        "vector_store": vs_removed,
         "concepts_removed": kg_removed,
     }
 

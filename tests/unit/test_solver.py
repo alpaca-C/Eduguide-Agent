@@ -291,25 +291,22 @@ class TestAnswer:
 
     @pytest.mark.asyncio
     async def test_answer_no_results_but_synthesis_ok(self, solver):
-        """Even without search results, synthesis should still produce an answer."""
+        """With empty/invalid observations, guard returns empty_result (no hallucination)."""
         solver._rewriter.rewrite = AsyncMock(return_value=["query1"])
-        solver._tools = {}  # No tools registered
-
-        solver._llm_retry = AsyncMock(
-            return_value=_make_llm_response("基于我的知识，梯度下降是...")
-        )
+        solver._tools = {}  # No tools registered → no valid observations
 
         result = await solver._answer("什么是梯度下降", doc_filter=None, chat_history=None)
 
-        assert result["route"] == "done"  # Has reply text
-        assert "梯度下降" in result["reply"]
+        # Guard should refuse to synthesize with no valid observations
+        assert result["route"] == "empty_result"
+        assert "未找到" in result["reply"]
 
     @pytest.mark.asyncio
     async def test_answer_escalates_when_empty(self, solver):
-        """When both observations and reply are empty, escalate to Planner."""
+        """When tools fail and no valid observations, guard returns empty_result."""
         solver._rewriter.rewrite = AsyncMock(return_value=["query1"])
 
-        # Tool raises exception → observations stays empty
+        # Tool raises exception → error ToolResult, filtered out by guard
         solver._tools = {
             "rag_search": {
                 "name": "rag_search",
@@ -317,14 +314,11 @@ class TestAnswer:
             }
         }
 
-        # Synthesis returns empty
-        solver._llm_retry = AsyncMock(
-            return_value=_make_llm_response("")
-        )
-
         result = await solver._answer("复杂问题", doc_filter=None, chat_history=None)
 
-        assert result["route"] == "escalate"
+        # Guard catches that all valid_obs are empty → empty_result (not escalate)
+        assert result["route"] == "empty_result"
+        assert "未找到" in result["reply"]
 
     @pytest.mark.asyncio
     async def test_answer_handles_synthesis_failure(self, solver):
@@ -356,7 +350,15 @@ class TestSolverRun:
     async def test_run_success(self, solver):
         """run() should extract question from AgentInput and return AgentOutput."""
         solver._rewriter.rewrite = AsyncMock(return_value=["q1"])
-        solver._tools = {}
+        # Must have a working tool that returns valid content
+        solver._tools = {
+            "rag_search": {
+                "name": "rag_search",
+                "func": AsyncMock(return_value=ToolResult(
+                    tool_name="rag_search", query="q1", content="valid search results",
+                )),
+            }
+        }
         solver._llm_retry = AsyncMock(
             return_value=_make_llm_response("答案")
         )

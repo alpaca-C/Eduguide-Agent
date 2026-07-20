@@ -108,10 +108,10 @@ class TestKnowledgeDeleteChapter:
         assert "Invalid label format" in response.json()["detail"]
 
     def test_delete_chapter_valid_label(self, knowledge_client):
-        """Valid label should trigger vs.remove_by_chapter and kg.remove_by_doc."""
+        """Valid label should trigger vs.remove_by_chapter and kg.remove_by_chapter."""
         import src.api.router_knowledge as rk
         rk.vs.remove_by_chapter.return_value = 5
-        rk.kg.remove_by_doc.return_value = 3
+        rk.kg.remove_by_chapter.return_value = 3
 
         # URL encode the brackets: [file.pdf] title
         response = knowledge_client.delete(

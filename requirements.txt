@@ -10,6 +10,7 @@ markdown>=3.7.0,<4.0
 
 # Config & Env
 pydantic>=2.13.0,<3.0
+pydantic-settings>=2.0.0,<3.0
 python-dotenv>=1.2.0,<2.0
 
 # Backend API

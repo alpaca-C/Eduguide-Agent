@@ -97,12 +97,25 @@ class BaseAgent(ABC):
 
         Uses ainvoke (async) to avoid blocking the event loop.
         All agents should use this instead of hand-rolling retry loops.
+        Fires harness before/after LLM hooks for structured logging.
         """
         llm = llm or self._make_llm()
         last_error = None
+
+        # Resolve agent name and model for hooks
+        agent_name = self.__class__.__name__
+        model = getattr(llm, "model_name", "") or getattr(self._config, "llm_model_id", "?")
+
         for attempt in range(max_retries + 1):
             try:
-                return await llm.ainvoke(messages)
+                # ── Before-LLM hook ──
+                await self._fire_before_llm(agent_name, model, len(messages))
+
+                response = await llm.ainvoke(messages)
+
+                # ── After-LLM hook ──
+                await self._fire_after_llm(agent_name, model, len(messages), response)
+                return response
             except Exception as e:
                 last_error = e
                 if attempt < max_retries:
@@ -113,3 +126,38 @@ class BaseAgent(ABC):
                     )
                     await asyncio.sleep(delay)
         raise last_error  # type: ignore[misc]
+
+    @staticmethod
+    async def _fire_before_llm(agent_name: str, model: str, msg_count: int) -> None:
+        """Fire harness before-LLM hooks. Silently no-op if harness not initialized."""
+        try:
+            from src.harness import get_hook_manager, LLMHookContext, get_request_id
+            manager = get_hook_manager()
+            if manager is not None:
+                ctx = LLMHookContext(
+                    request_id=get_request_id(),
+                    agent_name=agent_name,
+                    model=model,
+                    message_count=msg_count,
+                )
+                await manager.fire_before_llm(ctx)
+        except Exception:
+            pass  # Hook failure must not break the LLM call
+
+    @staticmethod
+    async def _fire_after_llm(agent_name: str, model: str, msg_count: int,
+                              response: Any) -> None:
+        """Fire harness after-LLM hooks. Silently no-op if harness not initialized."""
+        try:
+            from src.harness import get_hook_manager, LLMHookContext, get_request_id
+            manager = get_hook_manager()
+            if manager is not None:
+                ctx = LLMHookContext(
+                    request_id=get_request_id(),
+                    agent_name=agent_name,
+                    model=model,
+                    message_count=msg_count,
+                )
+                await manager.fire_after_llm(ctx, response)
+        except Exception:
+            pass  # Hook failure must not break the LLM call

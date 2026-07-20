@@ -1,10 +1,19 @@
-"""Tools module for the QA Reflection Agent."""
+"""Tools module for the QA Reflection Agent.
+
+Tool functions are automatically wrapped with harness hooks at registration
+time — every tool call goes through before/after hooks for logging, permission
+checks, and rate limiting. Callers (Executor, DirectSolver) need no changes.
+"""
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Awaitable
+
+logger = logging.getLogger(__name__)
 
 
 class ToolErrorType(Enum):
@@ -46,9 +55,75 @@ ToolFunc = Callable[..., Awaitable[ToolResult]]
 _tool_registry: dict[str, dict] = {}
 
 
+def _wrap_with_hooks(name: str, func: ToolFunc) -> ToolFunc:
+    """Wrap a tool function to go through harness hooks.
+
+    On every call: fire before-hooks → execute → fire after-hooks.
+    If before-hooks raise RateLimitError → return ToolResult(RATE_LIMITED).
+    If before-hooks raise PermissionError → return ToolResult(INTERNAL).
+    """
+    async def wrapped(*args, **kwargs):
+        try:
+            from src.harness import (
+                get_hook_manager, ToolHookContext,
+                get_request_id, _agent_name,
+            )
+        except ImportError:
+            # Harness not initialized — call directly
+            return await func(*args, **kwargs)
+
+        manager = get_hook_manager()
+        if manager is None:
+            return await func(*args, **kwargs)
+
+        agent_name = _agent_name.get()
+        ctx = ToolHookContext(
+            request_id=get_request_id(),
+            agent_name=agent_name,
+            tool_name=name,
+            tool_args={"args": str(args)[:200], "kwargs": str(kwargs)[:200]},
+        )
+
+        # Before hooks (permission, rate limit, logging)
+        try:
+            await manager.fire_before_tool(ctx)
+        except PermissionError:
+            return ToolResult(
+                tool_name=name,
+                query=str(kwargs.get("query", "")),
+                content=f"（工具 {name} 无调用权限：{agent_name}）",
+                error=ToolErrorType.INTERNAL,
+                error_detail=f"Permission denied for agent '{agent_name}' on tool '{name}'",
+            )
+        except Exception:
+            # RateLimitError or other — treat as rate-limited
+            return ToolResult(
+                tool_name=name,
+                query=str(kwargs.get("query", "")),
+                content=f"（工具 {name} 调用频率超限，请稍后重试）",
+                error=ToolErrorType.RATE_LIMITED,
+                error_detail="Rate limit exceeded",
+            )
+
+        # Execute
+        t0 = time.time()
+        result = await func(*args, **kwargs)
+        ctx.timestamp = t0  # Reset to call start time for latency calc
+
+        # After hooks (logging, stats)
+        await manager.fire_after_tool(ctx, result)
+        return result
+
+    return wrapped
+
+
 def register_tool(name: str, description: str, func: ToolFunc):
-    """Register a tool for the agent to use."""
-    _tool_registry[name] = {"name": name, "description": description, "func": func}
+    """Register a tool for the agent to use. Wraps with harness hooks."""
+    _tool_registry[name] = {
+        "name": name,
+        "description": description,
+        "func": _wrap_with_hooks(name, func),
+    }
 
 
 def get_tool_registry() -> dict:

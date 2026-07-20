@@ -1,4 +1,4 @@
-"""QA Chat endpoint — SSE streaming answer with QASystem."""
+"""QA Chat endpoint — SSE streaming answer via Supervisor."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .schemas import ChatRequest
-from .deps import store
+from .deps import supervisor, store  # store kept for backward compat (tests access router_chat.store)
+from src.skills.skill_base import SkillInput
 
 logger = logging.getLogger(__name__)
 
@@ -27,71 +28,68 @@ async def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())[:12]
     filter_docs = set(req.doc_filter) if req.doc_filter else set()
 
+    if supervisor is None:
+        raise HTTPException(503, "QA service not initialized")
+
+    # Save user message
     try:
-        store.add_chat_message(session_id, "user", req.question)
-        store.save_session(session_id, req.question[:40], "[]", "")
+        supervisor._memory.short_term.add_message(session_id, "user", req.question)
+        supervisor._memory.short_term.save_session(session_id, req.question[:40], "[]", "")
     except Exception as e:
         logger.warning("Failed to save initial session message: %s", e)
 
-    try:
-        chat_history = store.get_chat_history(session_id) if session_id else []
-    except Exception as e:
-        logger.warning("Failed to load chat history for session %s: %s", session_id, e)
-        chat_history = []
+    # Build SkillInput — API layer injects QA-specific params
+    skill_input = SkillInput(
+        question=req.question,
+        params={
+            "doc_filter": filter_docs if filter_docs else None,
+            "tutor_mode": req.tutor_mode,
+        },
+    )
 
     def _sse(data: dict) -> str:
         return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     async def event_stream():
+        from src.harness import set_request_id, _agent_name
+        set_request_id()
+        _agent_name.set("Supervisor")
+
         yield _sse({"type": "status", "text": "正在分析问题...", "session_id": session_id})
         await asyncio.sleep(0.1)
 
         reply = ""
-        tool_calls_log = []
         rounds = 0
+        tool_calls_count = 0
 
         try:
-            from .deps import config as app_config
-            from src.agents.qa import get_agent
-            agent = get_agent(app_config)
-            result = await agent.answer(
-                req.question,
-                doc_filter=filter_docs if filter_docs else None,
-                chat_history=chat_history,
-            )
-            reply = result["reply"]
-            rounds = result.get("rounds", 0)
-            tool_calls_log = result.get("tool_calls", [])
-            if tool_calls_log:
-                tools_used = set(tc["tool"] for tc in tool_calls_log)
+            result = await supervisor.run(skill_input, session_id=session_id)
+            reply = result.reply
+            rounds = result.rounds
+            tool_calls_count = result.tool_calls
+            if tool_calls_count:
                 yield _sse({
                     "type": "status",
-                    "text": f"已检索 {len(tool_calls_log)} 次，正在生成回答...",
+                    "text": f"已检索 {tool_calls_count} 次，正在生成回答...",
                     "session_id": session_id,
                 })
                 await asyncio.sleep(0.1)
         except Exception as e:
-            logger.error("QA failed: %s", e)
+            logger.error("Supervisor failed: %s", e)
             reply = f"处理出错: {e}"
 
-        # Stream reply character by character
+        # Stream reply
         yield _sse({"type": "reply_start", "session_id": session_id})
         chunk_size = 8
         for i in range(0, len(reply), chunk_size):
             yield _sse({"type": "reply_chunk", "text": reply[i:i + chunk_size]})
             await asyncio.sleep(0.02)
 
-        # Save assistant reply before done event
-        try:
-            store.add_chat_message(session_id, "assistant", reply)
-        except Exception as e:
-            logger.warning("Failed to save assistant reply for session %s: %s", session_id, e)
-
         yield _sse({
             "type": "done",
             "session_id": session_id,
             "rounds": rounds,
-            "tool_calls": len(tool_calls_log),
+            "tool_calls": tool_calls_count,
         })
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

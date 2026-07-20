@@ -45,6 +45,7 @@ def _headers() -> dict:
 def parse_pdf(
     filepath: str | Path,
     max_pages: int | None = None,
+    page_range: tuple[int, int] | None = None,
     language: str = "ch",
 ) -> str:
     """Parse a PDF using MinerU cloud API. Returns extracted text (markdown).
@@ -52,8 +53,8 @@ def parse_pdf(
     Args:
         filepath: Path to the PDF file.
         max_pages: Only parse the first N pages (None = all).
-                   Uses server-side page_ranges parameter — the full file is
-                   uploaded but MinerU only processes the specified pages.
+        page_range: Only parse pages [start, end] (1-indexed, both inclusive).
+                    Uses server-side page_ranges parameter.
         language: Document language code (ch / en / auto).
 
     Returns:
@@ -68,11 +69,13 @@ def parse_pdf(
         logger.error("File not found: %s", filepath)
         return ""
 
-    # ---- Step 0: Truncate locally if only first N pages needed ----
+    # ---- Step 0: Build clean PDF from specified pages ----
+    # MinerU rejects many real-world PDFs. Render pages to PNG images
+    # and embed in a fresh standards-compliant PDF → 100% compatible.
     upload_path = filepath
     temp_file = None
-    if max_pages is not None:
-        temp_file = _extract_pages(filepath, max_pages)
+    if max_pages is not None or page_range is not None:
+        temp_file = _make_clean_pdf(filepath, max_pages=max_pages, page_range=page_range)
         if temp_file:
             upload_path = temp_file
         else:
@@ -84,8 +87,14 @@ def parse_pdf(
             upload_path.name, upload_path.stat().st_size,
         )
 
-        # page_ranges only needed when uploading full file (server-side truncation)
-        page_ranges = f"1-{max_pages}" if (max_pages and not temp_file) else None
+        # Server-side page_ranges: only needed if uploading original PDF.
+        # When using a clean temp PDF, pages are already extracted.
+        page_ranges = None
+        if not temp_file:
+            if page_range:
+                page_ranges = f"{page_range[0]}-{page_range[1]}"
+            elif max_pages:
+                page_ranges = f"1-{max_pages}"
         task_data = _submit_upload(upload_path, language, page_ranges=page_ranges)
         if not task_data:
             return ""
@@ -112,17 +121,20 @@ def parse_pdf(
 # ===========================================================================
 
 
-def _extract_pages(filepath: Path, max_pages: int) -> Path | None:
-    """Extract the first `max_pages` from a PDF into a temporary file.
+def _make_clean_pdf(filepath: Path, max_pages: int | None = None,
+                   page_range: tuple[int, int] | None = None) -> Path | None:
+    """Render specified PDF pages to PNG images → new clean standards-compliant PDF.
 
-    Renders each page to a PNG image at 200 DPI, then embeds it in a
-    clean standards-compliant PDF. This avoids ALL original-PDF format
-    issues (JBIG2, JPEG2000, corrupted xref tables, etc.) that cause
-    MinerU to reject the file as "corrupted".
+    MinerU rejects many real-world PDFs due to JBIG2/JPEG2000/corrupted xref
+    tables. This function bypasses all format issues by rendering pages to
+    PNG images (universally supported) and embedding them in a fresh PDF.
 
-    Uses `stream=png_bytes` (not raw `pixmap`) for maximum compatibility
-    with any PDF processor — the output is a simple image-based PDF with
-    standard PNG-encoded page images.
+    Args:
+        filepath: Original PDF.
+        max_pages: First N pages (None = all).
+        page_range: Pages [start, end] (1-indexed, both inclusive).
+
+    Returns path to temp PDF, or None if no extraction needed.
     """
     import tempfile
     import os as _os
@@ -136,17 +148,27 @@ def _extract_pages(filepath: Path, max_pages: int) -> Path | None:
     try:
         doc = fitz.open(str(filepath))
         total = len(doc)
-        limit = min(max_pages, total)
 
-        if limit >= total:
+        # Determine page indices (0-indexed)
+        if page_range:
+            indices = list(range(max(0, page_range[0] - 1), min(page_range[1], total)))
+        elif max_pages:
+            limit = min(max_pages, total)
+            if limit >= total:
+                doc.close()
+                return None
+            indices = list(range(limit))
+        else:
             doc.close()
-            return None  # No truncation needed
+            return None
+
+        if not indices:
+            doc.close()
+            return None
 
         # Render each page as PNG and embed into a clean PDF.
-        # PNG is universally supported — avoids all compatibility issues
-        # that MinerU has with specialized PDF encodings.
         new_doc = fitz.open()
-        for i in range(limit):
+        for i in indices:
             page = doc[i]
             # Render at 200 DPI for good OCR quality
             pix = page.get_pixmap(dpi=200)
@@ -164,8 +186,8 @@ def _extract_pages(filepath: Path, max_pages: int) -> Path | None:
         doc.close()
 
         logger.info(
-            "[MinerU] rendered %d/%d pages as PNG-image PDF: %.1f MB → %.1f MB",
-            limit, total,
+            "[MinerU] rendered %d pages as PNG-image PDF: %.1f MB → %.1f MB",
+            len(indices),
             filepath.stat().st_size / (1024 * 1024),
             tmp_path.stat().st_size / (1024 * 1024),
         )
