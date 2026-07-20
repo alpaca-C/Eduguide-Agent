@@ -12,18 +12,18 @@ from unittest.mock import MagicMock, patch
 
 def _mock_vs_dense(query: str, top_k: int, filter_docs=None) -> list[dict]:
     return [
-        {"text": "库仑定律：两点电荷间的作用力与电荷量的乘积成正比，与距离的平方成反比。",
+        {"chunk_id": "chunk_1", "text": "库仑定律：两点电荷间的作用力与电荷量的乘积成正比，与距离的平方成反比。",
          "doc_filename": "电磁学.pdf", "chapter_title": "第一章 静电场", "source": "dense"},
-        {"text": "电场强度定义为单位正电荷所受的力，是矢量。",
+        {"chunk_id": "chunk_2", "text": "电场强度定义为单位正电荷所受的力，是矢量。",
          "doc_filename": "电磁学.pdf", "chapter_title": "第一章 静电场", "source": "dense"},
     ]
 
 
 def _mock_vs_sparse(query: str, top_k: int, filter_docs=None) -> list[dict]:
     return [
-        {"text": "库仑定律的数学表达式为 F = k·q₁q₂/r²。",
+        {"chunk_id": "chunk_3", "text": "库仑定律的数学表达式为 F = k·q₁q₂/r²。",
          "doc_filename": "电磁学.pdf", "chapter_title": "第一章 静电场", "source": "sparse"},
-        {"text": "库仑定律适用于点电荷，对于连续分布电荷需要积分处理。",
+        {"chunk_id": "chunk_4", "text": "库仑定律适用于点电荷，对于连续分布电荷需要积分处理。",
          "doc_filename": "电磁学.pdf", "chapter_title": "第二章 电场计算", "source": "sparse"},
     ]
 
