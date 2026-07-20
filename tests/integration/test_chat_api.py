@@ -22,10 +22,16 @@ def _mock_qa_result():
     }
 
 
-def _mock_agent():
-    agent = MagicMock()
-    agent.answer = AsyncMock(return_value=_mock_qa_result())
-    return agent
+def _mock_supervisor_result():
+    """Mock SupervisorOutput matching what the endpoint expects."""
+    from dataclasses import dataclass
+    return type("SupervisorOutput", (), {
+        "reply": "库仑定律是电磁学的基本定律，描述了两个点电荷之间的相互作用力：F = k·q₁q₂/r²。",
+        "rounds": 2,
+        "tool_calls": 3,
+        "route": "moderate",
+        "session_id": "test-session",
+    })()
 
 
 def _parse_sse_events(streaming_response) -> list[dict]:
@@ -43,7 +49,7 @@ def _parse_sse_events(streaming_response) -> list[dict]:
 
 @pytest.fixture
 def chat_client(mock_deps):
-    """Create TestClient with QA agent and store mocked."""
+    """Create TestClient with Supervisor and store mocked."""
     mock_deps.store.add_chat_message.return_value = None
     mock_deps.store.save_session.return_value = None
     mock_deps.store.get_chat_history.return_value = [
@@ -51,8 +57,14 @@ def chat_client(mock_deps):
         {"role": "assistant", "content": "你好！有什么可以帮助你的？"},
     ]
 
+    # Mock supervisor.run instead of the old get_agent path
+    mock_supervisor = MagicMock()
+    mock_supervisor.run = AsyncMock(return_value=_mock_supervisor_result())
+    mock_supervisor._memory = MagicMock()
+    mock_supervisor._memory.short_term = mock_deps.store
+
     with mock_deps.set(
-        **{"src.agents.qa.get_agent": lambda _: _mock_agent()}
+        **{"src.api.router_chat.supervisor": mock_supervisor}
     ).patch():
         from src.api import app
         yield TestClient(app)
@@ -107,36 +119,34 @@ class TestChatEndpoint:
         assert "tool_calls" in done
 
     def test_chat_passes_doc_filter(self, chat_client):
-        mock_agent = _mock_agent()
-        # Override just the QA agent for this test
-        with chat_client:
-            # Re-patch with a specific agent to capture call_args
-            from unittest.mock import patch
-            with patch("src.agents.qa.get_agent", return_value=mock_agent):
-                import src.api
-                # Regenerate app with overridden dep
-                from fastapi.testclient import TestClient as TC
-                # Use the existing patched modules
-                resp = chat_client.post("/api/chat", json={
-                    "question": "什么是梯度下降",
-                    "doc_filter": ["ml_book.pdf", "dl_book.pdf"],
-                })
-                list(resp.iter_lines())
-        # Verify doc_filter passed to agent
-        call_kwargs = mock_agent.answer.call_args.kwargs
-        assert call_kwargs["doc_filter"] == {"ml_book.pdf", "dl_book.pdf"}
+        """doc_filter should be passed through to SkillInput.params."""
+        mock_sup = MagicMock()
+        mock_sup.run = AsyncMock(return_value=_mock_supervisor_result())
+        mock_sup._memory = MagicMock()
+        mock_sup._memory.short_term = MagicMock()
+
+        from unittest.mock import patch
+        with patch("src.api.router_chat.supervisor", mock_sup):
+            resp = chat_client.post("/api/chat", json={
+                "question": "什么是梯度下降",
+                "doc_filter": ["ml_book.pdf", "dl_book.pdf"],
+            })
+            list(resp.iter_lines())
+
+        # Verify SkillInput.params["doc_filter"] was passed to supervisor
+        call_args = mock_sup.run.call_args
+        skill_input = call_args[0][0]  # first positional arg
+        assert skill_input.params["doc_filter"] == {"ml_book.pdf", "dl_book.pdf"}
 
     def test_chat_handles_qa_failure_gracefully(self, mock_deps):
-        """When QA agent raises, the endpoint should still stream an error."""
-        mock_agent = MagicMock()
-        mock_agent.answer = AsyncMock(side_effect=Exception("QA system down"))
-
-        mock_deps.store.add_chat_message.return_value = None
-        mock_deps.store.save_session.return_value = None
-        mock_deps.store.get_chat_history.return_value = []
+        """When Supervisor raises, the endpoint should still stream an error."""
+        mock_sup = MagicMock()
+        mock_sup.run = AsyncMock(side_effect=Exception("QA system down"))
+        mock_sup._memory = MagicMock()
+        mock_sup._memory.short_term = MagicMock()
 
         with mock_deps.set(
-            **{"src.agents.qa.get_agent": lambda _: mock_agent}
+            **{"src.api.router_chat.supervisor": mock_sup}
         ).patch():
             from src.api import app
             client = TestClient(app)

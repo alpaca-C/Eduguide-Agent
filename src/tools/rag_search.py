@@ -205,19 +205,9 @@ async def _candidates_to_result(
     query: str, top_k: int, filter_docs: Optional[set], full: bool,
 ) -> ToolResult:
     """Collect candidates from sources, CE rerank, format output."""
-    # Prefer MemoryManager when available; fall back to module-level globals
+    # Use module-level globals (MemoryManager path handled at higher level)
     vs = _vector_store
     kg = _knowledge_graph
-    if _memory_manager is not None:
-        try:
-            mm_vs = _memory_manager.semantic.vector_store
-            mm_kg = _memory_manager.semantic.knowledge_graph
-            if mm_vs is not None:
-                vs = mm_vs
-            if mm_kg is not None:
-                kg = mm_kg
-        except Exception:
-            pass
     if vs is None and kg is None:
         return ToolResult(
             tool_name="rag_search", query=query,
