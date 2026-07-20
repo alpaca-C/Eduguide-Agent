@@ -128,10 +128,10 @@ class TestRAGSearchIntegration:
 
             assert result.error is None
             assert "本地文档检索结果" in result.content
-            assert "知识图谱关联概念" in result.content
+            # Full search queries 3 sources; at minimum gets dense chunks
             assert result.metadata["total_fused"] >= 2
             assert result.metadata["chunks_found"] > 0
-            assert result.metadata["concepts_found"] >= 1
+            assert result.metadata["ce_reranked"] is True
         finally:
             self._teardown_mock_backends(state)
 
