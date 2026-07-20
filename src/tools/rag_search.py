@@ -220,21 +220,18 @@ async def _candidates_to_result(
 
     # Source 1: Dense (always — primary source)
     if vs is not None:
+        dense = []
         try:
-            # Prefer search_hybrid (primary API, used by mock tests)
-            if hasattr(vs, 'search_hybrid'):
-                hybrid = vs.search_hybrid(query, top_k=top_k * 2, filter_docs=filter_docs)
-                dense_results = hybrid.get("dense", [])
-            elif hasattr(vs, '_search_dense'):
-                dense_results = vs._search_dense(query, top_k=20, filter_docs=filter_docs) or []
-            elif hasattr(vs, 'search'):
-                dense_results = vs.search(query, top_k=top_k * 2, filter_docs=filter_docs) or []
-            else:
-                dense_results = []
+            dense = vs._search_dense(query, top_k=20, filter_docs=filter_docs) or []
         except Exception as e:
-            logger.warning("Dense search failed: %s", e)
-            dense_results = []
-        for r in dense_results:
+            logger.warning("Dense _search_dense failed: %s", e)
+        # Safety net: if _search_dense returned nothing (e.g. mock), try search
+        if not dense and hasattr(vs, 'search'):
+            try:
+                dense = vs.search(query, top_k=20, filter_docs=filter_docs) or []
+            except Exception:
+                pass
+        for r in dense:
             cid = r.get("chunk_id", "")
             if cid and cid not in seen_ids:
                 seen_ids.add(cid)
