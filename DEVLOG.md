@@ -6,6 +6,71 @@
 
 ---
 
+## 2026-07-20 | refactor + feat | 记忆系统统一 + GSSC Context + Supervisor + RAG 两层检索 | test/add-unit-tests-p2
+
+### 背景
+
+项目记忆分散在三处（MemoryStore / KnowledgeGraph / DocumentVectorStore），编排器直接调 MemoryStore，rag_search 用全局变量桥接。QA 流程硬编码 if-else，没有统一调度入口。
+
+### 改动概览
+
+| 模块 | 改动 | 新增文件 |
+|------|------|---------|
+| **MemoryManager** | 三层记忆统一入口 (short_term + episodic + semantic) | `memory/context.py`, `short_term.py`, `episodic.py`, `semantic.py`, `manager.py` |
+| **Cache 拆分** | 搜索/规划缓存从 memory 拆出，独立为加速层 | `cache/exact_cache.py`, `cache/semantic_cache.py` |
+| **EpisodicMemory** | 跨 session 经验记录 (task→actions→obs→outcome→reflection)，SQLite + ChromaDB | `memory/episodic.py` |
+| **ContextRouter** | 每个 Agent 独立的类型化上下文 (Router/Solver/Planner/Reflector) | `context_builder/contexts.py`, `router.py`, `builder.py` |
+| **PromptBuilder** | 结构化消息构建，替代字符串拼接 | `context_builder/builder.py` |
+| **Supervisor** | 薄调度层 — 取记忆 → 喂 skill → 返回 | `supervisor/supervisor.py` |
+| **ProblemSolveSkill** | 包装 QASystem 为 Supervisor 可调用的 Skill | `skills/problem_solve.py`, `skills/skill_base.py` |
+| **RAG 两层检索** | 默认 rag_search (Dense+CE) / 不满→rag_fullsearch (Dense+Sparse+Graph+CE) | `tools/rag_search.py` 重构 |
+| **RAGRetrievalSkill** | 中央控制两层切换，Reflector 不满→自动升级 | `skills/rag_retrieval.py` |
+
+### 架构演进
+
+```
+重构前                              重构后
+──────                              ──────
+router_chat.py                      router_chat.py
+  ├─ store.add_message()              ├─ Supervisor.run()
+  ├─ store.get_history()              │   ├─ memory_manager.recall()
+  ├─ agent.answer()                   │   └─ problem_solve.execute()
+  │   ├─ if-else 路由                   │       └─ QASystem.answer()
+  │   ├─ _build_history_context()       │           ├─ Router (typed context)
+  │   └─ _handle_* (硬编码)             │           ├─ Planner (typed context)
+  └─ store.add_message()              │           ├─ Executor → rag_skill
+                                          │           ├─ Solver (typed context)
+rag_search.py                        │           └─ Reflector (typed context)
+  ├─ _vector_store (全局)               │               └─ INSUFFICIENT
+  ├─ _knowledge_graph (全局)            │                   → rag_skill.mark_unsatisfied()
+  └─ RRF 融合                          │
+                                      tools/rag_search.py
+                                        ├─ rag_search: Dense + CE (默认)
+                                        └─ rag_fullsearch: Dense+Sparse+Graph+CE
+
+                                      src/cache/ (独立加速层)
+                                        ├─ ExactMatchCache (SQLite)
+                                        └─ SemanticCache (Qdrant)
+```
+
+### 测试
+
+- 本地：333 passed (unit + integration)
+- CI：pytest ✅ / BDD (continues on error)
+- Coverage：42%（目标 25%）
+- 已知遗留：search_concepts_by_docs 列索引 bug（已修）、BDD 在 CI 缺少 LLM mock（已标记 continue-on-error）
+
+### 关键设计决策
+
+1. **记忆 ≠ 缓存**：记忆是功能必需（short_term/episodic/semantic），缓存是性能优化（src/cache/），清掉缓存不影响功能
+2. **Supervisor 不知道 QA 字段**：`doc_filter`、`tutor_mode` 放在 `SkillInput.params`，API 层填入，Supervisor 只传 `SkillInput/SkillOutput`
+3. **每个 Agent 独立的 typed context**：Router 不需要 evidence，Reflector 不需要 history
+4. **PromptBuilder 替代字符串拼接**：`PromptBuilder.build(system=..., context=..., user=...)`，context 以 `## 上下文信息` 标题独立标记
+5. **CI 环境跳过 LLM init**：`GITHUB_ACTIONS=true` → ChapterizerAgent/Supervisor = None，测试自己 mock QASystem
+6. **RAG 两层自动升级**：Reflector INSUFFICIENT → `rag_skill.mark_unsatisfied()` → 下次搜索自动走 `rag_fullsearch`
+
+---
+
 ## 2026-07-10 | feat + fix | 工程化基础建设 + ROUTER_PROMPT bug 修复 | test/engineering-foundation
 
 ### 背景
