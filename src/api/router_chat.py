@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .schemas import ChatRequest
-from .deps import supervisor
+from .deps import supervisor, store  # store kept for backward compat (tests access router_chat.store)
 from src.skills.skill_base import SkillInput
 
 logger = logging.getLogger(__name__)
