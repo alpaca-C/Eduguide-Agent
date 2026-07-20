@@ -97,8 +97,8 @@ class TestRAGSearchIntegration:
         rs._knowledge_graph = orig_kg
 
     @pytest.mark.asyncio
-    async def test_hybrid_search_returns_fused_results(self):
-        """Three-source retrieval should produce fused, deduplicated results."""
+    async def test_default_search_uses_dense_with_ce(self):
+        """Default rag_search: Dense + Cross-Encoder only (no sparse/graph)."""
         orig_vs, orig_kg = self._setup_mock_backends()
         try:
             from src.tools.rag_search import rag_search
@@ -107,9 +107,25 @@ class TestRAGSearchIntegration:
 
             assert result.error is None
             assert "本地文档检索结果" in result.content
+            assert result.metadata["total_fused"] >= 1
+            assert result.metadata["chunks_found"] > 0
+            assert result.metadata["ce_reranked"] is True
+        finally:
+            self._teardown_mock_backends(orig_vs, orig_kg)
+
+    @pytest.mark.asyncio
+    async def test_fullsearch_includes_graph_and_sparse(self):
+        """rag_fullsearch: Dense + Sparse + Graph + Cross-Encoder."""
+        orig_vs, orig_kg = self._setup_mock_backends()
+        try:
+            from src.tools.rag_search import rag_fullsearch
+
+            result = await rag_fullsearch("库仑定律", top_k=3)
+
+            assert result.error is None
+            assert "本地文档检索结果" in result.content
             assert "知识图谱关联概念" in result.content
             assert result.metadata["total_fused"] >= 2
-            # Dense and sparse should have been fused (deduplicated similar texts)
             assert result.metadata["chunks_found"] > 0
             assert result.metadata["concepts_found"] >= 1
         finally:
