@@ -15,6 +15,7 @@ SOURCE_TO_SECTION: dict[str, str] = {
     "system_policy":   "role_policies",
     "tool":            "role_policies",
     "user_question":   "task",
+    "review_target":   "task",
     "conversation":    "context",
     "search_result":   "evidence",
     "kg_concept":      "evidence",

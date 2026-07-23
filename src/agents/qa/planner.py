@@ -15,6 +15,7 @@ from ...tools.rag_search import get_doc_names
 from ...prompts.qa.router import SYSTEM_PROMPT
 from ...prompts.qa.planner import PLAN_PROMPT, SOLVE_PROMPT
 from ...context_builder import PlannerContext, PromptBuilder
+from ...context_builder.schema import StructuredPrompt
 from .plan_schema import PlanOutput
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,8 @@ class Planner(BaseAgent):
 
     async def plan(self, question: str, feedback: str = "", history_ctx: str = "",
                    seed_decomposition: list[str] | None = None,
-                   planner_ctx: PlannerContext | None = None) -> list[dict]:
+                   planner_ctx: PlannerContext | None = None,
+                   structured_prompt: StructuredPrompt | None = None) -> list[dict]:
         """Decompose question into sub-questions. Incorporates reviewer feedback + history.
 
         Args:
@@ -51,7 +53,8 @@ class Planner(BaseAgent):
             feedback: Reviewer feedback from a previous round.
             history_ctx: Formatted conversation history context (legacy).
             seed_decomposition: Optional initial sub-questions from Router.
-            planner_ctx: Typed PlannerContext (preferred over history_ctx).
+            planner_ctx: Typed PlannerContext (legacy fallback).
+            structured_prompt: GSSC StructuredPrompt (preferred).
         """
         doc_names = self._get_doc_list()
         doc_list = f"共{len(doc_names)}本：{', '.join(doc_names)}" if doc_names else "（暂无已上传教材）"
@@ -80,7 +83,12 @@ class Planner(BaseAgent):
             feedback_section=feedback_section,
         )
 
-        if planner_ctx is not None:
+        if structured_prompt is not None:
+            messages = [
+                SystemMessage(content=system_prompt + "\n\n" + structured_prompt.to_prompt()),
+                HumanMessage(content="请分解以上问题。"),
+            ]
+        elif planner_ctx is not None:
             messages = PromptBuilder.build(
                 system=system_prompt,
                 context=planner_ctx,
@@ -102,11 +110,13 @@ class Planner(BaseAgent):
         return await self._parse_and_validate(text, system_prompt)
 
     async def solve(self, question: str, observations: str, history_ctx: str = "",
-                    solver_ctx=None, reasoning_feedback: str = "") -> str:
+                    solver_ctx=None, reasoning_feedback: str = "",
+                    structured_prompt: StructuredPrompt | None = None) -> str:
         """Synthesize answer from sub-question results.
 
         Args:
-            solver_ctx: Typed SolverContext (preferred over raw history_ctx).
+            solver_ctx: Typed SolverContext (legacy fallback).
+            structured_prompt: GSSC StructuredPrompt (preferred).
             reasoning_feedback: Optional logic review feedback from Reflector.
                 Injected into the prompt to guide reasoning fixes without re-searching.
         """
@@ -139,7 +149,12 @@ class Planner(BaseAgent):
             reasoning_feedback=reasoning_section,
         )
 
-        if solver_ctx is not None:
+        if structured_prompt is not None:
+            messages = [
+                SystemMessage(content=system_prompt + "\n\n" + structured_prompt.to_prompt()),
+                HumanMessage(content="请综合以上搜索结果回答学生原始问题。如果资料不足以回答，请明确告知学生而不是编造内容。"),
+            ]
+        elif solver_ctx is not None:
             from ...context_builder import SolverContext
             messages = PromptBuilder.build(
                 system=system_prompt,

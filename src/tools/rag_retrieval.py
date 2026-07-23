@@ -1,33 +1,36 @@
-# RAG Retrieval Skill — centrally managed two-tier retrieval.
+# RAG Retrieval Strategy — centrally managed two-tier retrieval.
+#
+# NOT a Supervisor Skill (doesn't implement Skill ABC). This is a retrieval
+# strategy controller registered as a TOOL so Executor can call it.
 #
 # Default:  rag_search      (Dense + Cross-Encoder)  — fast, 80% of queries
 # Escalate: rag_fullsearch  (Dense + Sparse + Graph + Cross-Encoder)
 #           triggered when Reflector feedback or user marks answer bad.
 #
-# The skill tracks which queries got poor feedback and auto-escalates
+# The strategy tracks which queries got poor feedback and auto-escalates
 # on re-search within the same session.
 
 from __future__ import annotations
 
 import logging
 
-from ..tools import ToolResult, register_tool, get_tool_registry
+from . import ToolResult, register_tool, get_tool_registry
 
 logger = logging.getLogger(__name__)
 
-_skill_instance = None
+_strategy_instance = None
 
 
-class RAGRetrievalSkill:
+class RAGRetrievalStrategy:
     """Central handler for RAG retrieval — chooses fast vs full based on state.
 
     Usage:
-        skill = RAGRetrievalSkill()
-        result = await skill.search("高斯定理")
+        strategy = RAGRetrievalStrategy()
+        result = await strategy.search("高斯定理")
 
         # After bad feedback from Reflector:
-        skill.mark_unsatisfied("高斯定理")
-        result = await skill.search("高斯定理")  # → auto-escalates to full
+        strategy.mark_unsatisfied("高斯定理")
+        result = await strategy.search("高斯定理")  # → auto-escalates to full
     """
 
     def __init__(self):
@@ -49,12 +52,12 @@ class RAGRetrievalSkill:
         should_full = force_full or self._should_escalate(query)
 
         if should_full:
-            logger.info("RAGRetrievalSkill: FULLSEARCH for '%s' (unsatisfied=%s, force=%s)",
+            logger.info("RAGRetrievalStrategy: FULLSEARCH for '%s' (unsatisfied=%s, force=%s)",
                          query[:60], query in self._unsatisfied, force_full)
-            from ..tools.rag_search import rag_fullsearch
+            from .rag_search import rag_fullsearch
             result = await rag_fullsearch(query, top_k=top_k, filter_docs=filter_docs)
         else:
-            from ..tools.rag_search import rag_search
+            from .rag_search import rag_search
             result = await rag_search(query, top_k=top_k, filter_docs=filter_docs)
 
         return result
@@ -64,13 +67,13 @@ class RAGRetrievalSkill:
         self._unsatisfied.add(query.strip().lower())
         if session_id:
             self._escalate_session.add(session_id)
-        logger.info("RAGRetrievalSkill: marked '%s' as unsatisfied", query[:60])
+        logger.info("RAGRetrievalStrategy: marked '%s' as unsatisfied", query[:60])
 
     def mark_satisfied(self, query: str):
         """Clear the escalation flag for a query."""
         q = query.strip().lower()
         self._unsatisfied.discard(q)
-        logger.info("RAGRetrievalSkill: cleared '%s'", query[:60])
+        logger.info("RAGRetrievalStrategy: cleared '%s'", query[:60])
 
     def reset(self):
         """Clear all escalation state."""
@@ -91,21 +94,26 @@ class RAGRetrievalSkill:
         return False
 
 
-def get_rag_skill() -> RAGRetrievalSkill:
-    """Get or create the global RAGRetrievalSkill singleton."""
-    global _skill_instance
-    if _skill_instance is None:
-        _skill_instance = RAGRetrievalSkill()
-    return _skill_instance
+def get_rag_strategy() -> RAGRetrievalStrategy:
+    """Get or create the global RAGRetrievalStrategy singleton."""
+    global _strategy_instance
+    if _strategy_instance is None:
+        _strategy_instance = RAGRetrievalStrategy()
+    return _strategy_instance
 
 
 # ── Tool registration (so Executor can call it) ─────────────────────────
+#
+# rag_search  and rag_fullsearch are separate low-level tools (src/tools/rag_search.py).
+# rag_skill  is this smart dispatcher — Executor uses it as the single entry point,
+# and it auto-chooses between rag_search (fast) and rag_fullsearch (full) based on
+# feedback history.
 
 async def _rag_skill_search(query: str, top_k: int = 5,
                             filter_docs: set[str] | None = None) -> ToolResult:
-    """Tool wrapper: delegates to RAGRetrievalSkill."""
-    skill = get_rag_skill()
-    return await skill.search(query, top_k=top_k, filter_docs=filter_docs)
+    """Tool wrapper: delegates to RAGRetrievalStrategy."""
+    strategy = get_rag_strategy()
+    return await strategy.search(query, top_k=top_k, filter_docs=filter_docs)
 
 
 register_tool(

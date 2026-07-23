@@ -27,14 +27,16 @@ class Executor(BaseAgent):
     async def run(self, input: AgentInput) -> AgentOutput:
         plan = input.metadata.get("plan", [])
         doc_filter = input.metadata.get("doc_filter")
+        history_ctx = input.metadata.get("history_ctx", "")
         try:
-            results = await self.execute(plan, doc_filter)
+            results = await self.execute(plan, doc_filter, history_ctx=history_ctx)
             return AgentOutput(success=True, metadata={"results": results})
         except Exception as e:
             return AgentOutput(success=False, error=str(e))
 
     async def execute(
         self, plan: list[dict], doc_filter: set[str] | None = None,
+        history_ctx: str = "",
     ) -> list[dict]:
         """Execute planned searches in dependency-ordered rounds.
 
@@ -106,7 +108,7 @@ class Executor(BaseAgent):
                 # 2) Fallback: QueryRewriter if keywords still sparse
                 if len(keywords) < 3 and sub_question:
                     try:
-                        extra = await self._rewriter.rewrite(sub_question)
+                        extra = await self._rewriter.rewrite(sub_question, history=history_ctx)
                         for ek in extra:
                             if ek not in keywords:
                                 keywords.append(ek)

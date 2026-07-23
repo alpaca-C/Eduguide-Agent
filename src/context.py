@@ -36,8 +36,10 @@ from .memory.manager import MemoryManager
 from .cache import ExactMatchCache
 from .context_builder import GSSCPipeline
 from .tools import get_tool_registry
-from .skills.rag_retrieval import RAGRetrievalSkill
+from .tools.rag_retrieval import RAGRetrievalStrategy
 from .skills.problem_solve import ProblemSolveSkill
+from .skills.exercise_tutor import ExerciseTutorSkill
+from .skills import SkillRegistry
 from .supervisor import Supervisor
 
 logger = logging.getLogger(__name__)
@@ -74,9 +76,9 @@ class AppContext:
     gssc_pipeline: GSSCPipeline = field(default=None, repr=False)
 
     # RAG retrieval skill (manages fast/full tier switching)
-    rag_skill: RAGRetrievalSkill = field(default=None, repr=False)
+    rag_skill: RAGRetrievalStrategy = field(default=None, repr=False)
 
-    # Supervisor — thin dispatch layer above skills
+    # Supervisor — LLM Agent, reads SkillRegistry metadata to select skills
     supervisor: Supervisor = field(default=None, repr=False)
 
     # These are initialized lazily to avoid heavy imports at module load time
@@ -169,18 +171,26 @@ def init_context(
     logger.info("GSSCPipeline: Gather→Select→Structure→Compress ready")
 
     # Build RAG retrieval skill (manages fast/full tier switching)
-    ctx.rag_skill = RAGRetrievalSkill()
-    logger.info("RAGRetrievalSkill: Dense+CE (default) / Dense+Sparse+Graph+CE (full) ready")
+    ctx.rag_skill = RAGRetrievalStrategy()
+    logger.info("RAGRetrievalStrategy: Dense+CE (default) / Dense+Sparse+Graph+CE (full) ready")
 
     # Build QASystem → wrap in ProblemSolveSkill → build Supervisor
     # Skip in CI: tests mock their own QASystem instances
     if not _in_ci:
         try:
             from .agents.qa.orchestrator import QASystem
-            qa_system = QASystem(config, gssc_pipeline=ctx.gssc_pipeline, rag_skill=ctx.rag_skill)
+            qa_system = QASystem(config, gssc_pipeline=ctx.gssc_pipeline,
+                                rag_skill=ctx.rag_skill,
+                                memory_manager=ctx.memory_manager)
             problem_solve = ProblemSolveSkill(qa_system)
-            ctx.supervisor = Supervisor(ctx.memory_manager, {"problem_solve": problem_solve})
-            logger.info("Supervisor: ready (1 skill registered: problem_solve)")
+            exercise_tutor = ExerciseTutorSkill(config)
+            # Build SkillRegistry — Supervisor reads metadata from here
+            registry = SkillRegistry()
+            registry.register(problem_solve)
+            registry.register(exercise_tutor)
+            ctx.supervisor = Supervisor(ctx.memory_manager, registry, config)
+            logger.info("Supervisor: ready (%d skills: %s)",
+                        len(registry), ", ".join(registry.list_names()))
         except Exception as e:
             logger.error("Supervisor init failed (QA will be unavailable): %s", e)
             ctx.supervisor = None

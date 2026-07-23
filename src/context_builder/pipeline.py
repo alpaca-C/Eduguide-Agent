@@ -61,6 +61,8 @@ class GSSCPipeline:
         search_results: list | None = None,
         feedback: str = "",
         current_round: int = 1,
+        memory_context=None,          # MemoryContext from MemoryManager.recall()
+        current_answer: str = "",      # Answer under review (for Reflector)
     ) -> StructuredPrompt:
         """Execute the full GSSC pipeline.
 
@@ -72,6 +74,9 @@ class GSSCPipeline:
             search_results: Executor's search results from current round.
             feedback: Reflector's feedback from previous round.
             current_round: Current reflection round (1, 2, or 3).
+            memory_context: Pre-built MemoryContext from MemoryManager.recall().
+                Passed through to EpisodicSource to avoid redundant ChromaDB queries.
+            current_answer: The answer being reviewed (for Reflector).
         """
         # ── G: Gather ─────────────────────────────────────────────────
         fragments: list[Fragment] = await self.gatherer.gather(
@@ -81,6 +86,8 @@ class GSSCPipeline:
             search_results=search_results,
             feedback=feedback,
             current_round=current_round,
+            memory_context=memory_context,
+            current_answer=current_answer,
         )
 
         # ── S: Select ─────────────────────────────────────────────────

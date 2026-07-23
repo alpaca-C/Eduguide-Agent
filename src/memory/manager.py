@@ -50,12 +50,17 @@ class MemoryManager:
         self,
         question: str,
         session_id: str | None = None,
+        user_id: str = "",
     ) -> MemoryContext:
         """Recall all relevant memories for a question.
 
         1. Short-term: loads conversation history and compresses it
         2. Episodic:  semantically searches past experiences for relevant lessons
         3. Semantic:  lists available document names (lightweight)
+
+        Args:
+            user_id: Passed to episodic.recall() to filter by user.
+                     Empty string = no filter (backward compatible).
         """
         # 1) Short-term: conversation history
         chat_history: list[dict] = []
@@ -63,15 +68,22 @@ class MemoryManager:
         if session_id:
             try:
                 chat_history = self.short_term.get_history(session_id)
+                if chat_history:
+                    logger.info(
+                        "[MEMORY] loaded %d messages for session=%s",
+                        len(chat_history), session_id,
+                    )
+                else:
+                    logger.info("[MEMORY] no history for session=%s (new conversation)", session_id)
             except Exception as e:
                 logger.warning("Failed to load chat history for %s: %s", session_id, e)
         history_context = self.short_term.build_context(chat_history)
 
-        # 2) Episodic: relevant past experiences
+        # 2) Episodic: relevant past experiences (filtered by user_id)
         episodes = []
         if self.episodic is not None:
             try:
-                episodes = self.episodic.recall(question, top_k=3)
+                episodes = self.episodic.recall(question, top_k=3, user_id=user_id)
             except Exception as e:
                 logger.warning("Episodic recall failed: %s", e)
 

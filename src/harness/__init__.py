@@ -38,6 +38,23 @@ _agent_name: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
+# ── Per-request counters (flushed to RecorderStore at request end) ──
+
+@dataclass
+class RequestCounters:
+    """Accumulated counters for one request. Reset per request."""
+    llm_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    tool_calls: int = 0
+    start_time: float = field(default_factory=time.time)
+
+
+_request_counters: contextvars.ContextVar[RequestCounters] = contextvars.ContextVar(
+    "request_counters", default=RequestCounters()
+)
+
+
 def get_request_id() -> str:
     """Get the current request ID. Returns empty string if not set."""
     return _request_id.get()
@@ -127,6 +144,72 @@ class HookManager:
         """
         self._tool_permissions = dict(permissions)
 
+    # ── Request lifecycle ──────────────────────────────────────────
+
+    def begin_request(self, request_id: str = ""):
+        """Start a new request context — resets counters."""
+        if not request_id:
+            request_id = str(uuid.uuid4())[:8]
+        _request_id.set(request_id)
+        _request_counters.set(RequestCounters())
+
+    def finish_request(
+        self, *, session_id: str = "", question: str = "",
+        route: str = "", rounds: int = 0,
+    ) -> dict | None:
+        """Flush accumulated counters to RecorderStore. Returns the record dict or None."""
+        counters = _request_counters.get()
+        rid = _request_id.get()
+        if not rid or counters.llm_calls == 0:
+            return None
+
+        try:
+            from src.monitoring.usage_store import (
+                get_recorder_store, RequestRecord,
+            )
+            record = RequestRecord(
+                request_id=rid,
+                session_id=session_id,
+                question=question,
+                route=route,
+                rounds=rounds,
+                llm_calls=counters.llm_calls,
+                prompt_tokens=counters.prompt_tokens,
+                completion_tokens=counters.completion_tokens,
+                tool_calls=counters.tool_calls,
+                total_latency_ms=(time.time() - counters.start_time) * 1000,
+            )
+            store = get_recorder_store()
+            store.insert_request(record)
+            total_tokens = counters.prompt_tokens + counters.completion_tokens
+            latency_ms = round(record.total_latency_ms)
+            # Print to console (always visible regardless of log level)
+            print(
+                f"[QA] {rid} | route={route} rounds={rounds} | "
+                f"LLM: {counters.llm_calls} calls, "
+                f"tokens={total_tokens} (in={counters.prompt_tokens} out={counters.completion_tokens}) | "
+                f"tools: {counters.tool_calls} calls | "
+                f"latency: {latency_ms}ms"
+            )
+            logger.info(
+                "[STATS] req=%s route=%s rounds=%d llm_calls=%d "
+                "tokens(in=%d out=%d total=%d) tool_calls=%d latency=%.0fms",
+                rid, route, rounds, counters.llm_calls,
+                counters.prompt_tokens, counters.completion_tokens,
+                total_tokens, counters.tool_calls, latency_ms,
+            )
+            return {
+                "request_id": rid, "route": route, "rounds": rounds,
+                "llm_calls": counters.llm_calls,
+                "prompt_tokens": counters.prompt_tokens,
+                "completion_tokens": counters.completion_tokens,
+                "tool_calls": counters.tool_calls,
+                "latency_ms": round(record.total_latency_ms),
+            }
+        except Exception as e:
+            logger.warning("[STATS] flush failed: %s", e)
+            return None
+
     # ── Fire hooks (called by the wrapper layer) ─────────────────
 
     async def fire_before_tool(self, ctx: ToolHookContext) -> None:
@@ -211,7 +294,11 @@ async def _log_before_tool(ctx: ToolHookContext):
 
 
 async def _log_after_tool(ctx: ToolHookContext, result: Any):
-    """Default hook: log tool call result with latency."""
+    """Default hook: log tool call result with latency + accumulate counter."""
+    # Accumulate
+    counters = _request_counters.get()
+    counters.tool_calls += 1
+
     latency = time.time() - ctx.timestamp
     status = "OK"
     detail = ""
@@ -228,7 +315,10 @@ async def _log_after_tool(ctx: ToolHookContext, result: Any):
 
 
 async def _log_before_llm(ctx: LLMHookContext):
-    """Default hook: log LLM call start."""
+    """Default hook: log LLM call start + accumulate call counter."""
+    counters = _request_counters.get()
+    counters.llm_calls += 1
+
     logger.info(
         "[HOOK] req=%s | agent=%s | LLM_START model=%s msgs=%d",
         ctx.request_id, ctx.agent_name, ctx.model, ctx.message_count,
@@ -236,17 +326,22 @@ async def _log_before_llm(ctx: LLMHookContext):
 
 
 async def _log_after_llm(ctx: LLMHookContext, response: Any):
-    """Default hook: log LLM call result with token usage and latency."""
+    """Default hook: log LLM call result with token usage + accumulate tokens."""
     latency = time.time() - ctx.timestamp
     resp_len = 0
-    tokens_in = "?"
-    tokens_out = "?"
+    tokens_in = 0
+    tokens_out = 0
     if hasattr(response, "content"):
         resp_len = len(str(response.content))
     if hasattr(response, "response_metadata"):
         usage = response.response_metadata.get("token_usage", {}) or {}
-        tokens_in = usage.get("prompt_tokens", "?")
-        tokens_out = usage.get("completion_tokens", "?")
+        tokens_in = usage.get("prompt_tokens", 0) or 0
+        tokens_out = usage.get("completion_tokens", 0) or 0
+
+    # Accumulate
+    counters = _request_counters.get()
+    counters.prompt_tokens += tokens_in
+    counters.completion_tokens += tokens_out
 
     logger.info(
         "[HOOK] req=%s | agent=%s | LLM_END model=%s latency=%.2fs "

@@ -100,7 +100,7 @@ class TestOrchestratorMaxRounds:
             qa._planner._llm_retry = _make_fake_retry(PLANNER_PLAN_JSON)
             # Reflector always says INSUFFICIENT
             qa._reflector._llm_retry = _make_fake_retry(REFLECTOR_INSUFFICIENT_JSON)
-            qa._executor._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
+            qa._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
 
             result = await qa.answer(
                 "麦克斯韦方程组推导", doc_filter=None, chat_history=None,
@@ -158,10 +158,10 @@ class TestOrchestratorWebSearch:
                 qa._router._llm_retry = _make_fake_retry(router_json)
                 # Mock the full pipeline so escalation to complex doesn't crash
                 qa._solver._llm_retry = _make_fake_retry("综合答案...")
-                qa._solver._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
+                qa._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
                 qa._planner._llm_retry = _make_fake_retry(PLANNER_PLAN_JSON)
                 qa._reflector._llm_retry = _make_fake_retry(REFLECTOR_SUFFICIENT_JSON)
-                qa._executor._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
+                qa._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
 
                 result = await qa.answer(
                     "什么是库仑定律？", doc_filter=None, chat_history=None,
@@ -195,7 +195,7 @@ class TestOrchestratorDocFilter:
             # propagation, not exercise the full tool→LLM pipeline.
             call_args_holder = {}
 
-            async def spy_answer(question, doc_filter, chat_history):
+            async def spy_answer(question, doc_filter, chat_history, **kwargs):
                 call_args_holder["doc_filter"] = doc_filter
                 return {
                     "reply": "测试回答", "route": "done",
@@ -262,3 +262,94 @@ class TestOrchestratorHistoryCompression:
 
         ctx = qa._build_history_context(None)
         assert ctx == ""
+
+    def test_summarize_sync_extracts_topics(self, mock_config):
+        """_summarize_sync should extract user question topics."""
+        from src.agents.qa.orchestrator import QASystem
+        qa = QASystem(mock_config)
+
+        older = [
+            {"role": "user", "content": "什么是库仑定律？"},
+            {"role": "assistant", "content": "库仑定律描述了..."},
+            {"role": "user", "content": "高斯定理怎么推导？"},
+        ]
+        summary = qa._summarize_sync(older)
+        assert "库仑定律" in summary
+        assert "高斯定理" in summary
+
+    def test_summarize_sync_no_user_messages(self, mock_config):
+        """When there are no user messages, return generic placeholder."""
+        from src.agents.qa.orchestrator import QASystem
+        qa = QASystem(mock_config)
+
+        older = [
+            {"role": "assistant", "content": "回答..."},
+        ]
+        summary = qa._summarize_sync(older)
+        assert "之前的对话" in summary
+
+    def test_build_history_context_medium(self, mock_config):
+        """7-12 messages: keep last 10, truncate older content to 200 chars."""
+        from src.agents.qa.orchestrator import QASystem
+        qa = QASystem(mock_config)
+
+        history = [
+            {"role": "user", "content": f"question {i}"}
+            for i in range(8)
+        ]
+        ctx = qa._build_history_context(history)
+        assert "最近 10 轮" in ctx
+        assert "question 0" in ctx
+
+    def test_build_history_context_many_rounds_triggers_summary(self, mock_config):
+        """>12 messages triggers old→summary + recent 8."""
+        from src.agents.qa.orchestrator import QASystem
+        qa = QASystem(mock_config)
+
+        history = [
+            {"role": "user", "content": f"user question number {i}"}
+            for i in range(15)
+        ]
+        ctx = qa._build_history_context(history)
+        assert "历史摘要" in ctx
+        assert "question number 14" in ctx  # recent messages preserved
+
+    def test_build_history_context_truncation(self, mock_config):
+        """Context > MAX_HISTORY_CHARS (4000) should be truncated."""
+        from src.agents.qa.orchestrator import QASystem
+        qa = QASystem(mock_config)
+
+        long_content = "很长的内容。" * 500  # ~3000 chars per message
+        history = [
+            {"role": "user", "content": long_content},
+            {"role": "assistant", "content": long_content},
+        ] * 6  # 12 messages, each ~3000 chars → way over 4000
+
+        ctx = qa._build_history_context(history)
+        assert len(ctx) <= 4200  # allow small margin from truncation marker
+        # truncation marker should be present
+        assert "历史已截断" in ctx or len(ctx) <= 4100
+
+
+# ========================================================================
+# _mk_input
+# ========================================================================
+
+class TestMkInput:
+    """AgentInput factory."""
+
+    def test_mk_input_basic(self, mock_config):
+        from src.agents.qa.orchestrator import QASystem
+        qa = QASystem(mock_config)
+
+        inp = qa._mk_input(question="test", doc_filter={"a.pdf"})
+        assert inp.metadata["question"] == "test"
+        assert inp.metadata["doc_filter"] == {"a.pdf"}
+
+    def test_mk_input_defaults(self, mock_config):
+        from src.agents.qa.orchestrator import QASystem
+        qa = QASystem(mock_config)
+
+        inp = qa._mk_input(question="q")
+        assert inp.metadata.get("doc_filter") is None
+        assert inp.metadata.get("chat_history") is None

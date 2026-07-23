@@ -725,3 +725,75 @@ for round_num in 1..3:
 所有相关模块 83 个测试全部通过。修复了两个历史遗留的 mock 不完整问题（`test_doc_filter_passed_to_solver`、`test_moderate_with_web_search_fallback`）。
 
 ### 待办
+
+---
+
+## 2026-07-21 | fix + feat | 上下文注入修复 + 会话复用 + 监控统计 + GSSC 全链路压缩 | main
+
+### 背景
+
+1. 多轮对话失忆：用户问"修改表的字段"后再问"举个例子"，系统无法理解上下文
+2. Token 消耗异常：一次 moderate 请求消耗 13000+ input token
+3. GSSC 管线未生效：Compressor 只接了 MemoryManager，工具返回的 observations 裸字符串手拼
+4. 监控缺失：无法按请求统计 token/延迟
+5. 前端侧边栏不更新、session_id 页面刷新后丢失
+
+### 改动概览
+
+| 模块 | 改动 | 文件 |
+|------|------|------|
+| **上下文注入** | 修复 4 条丢失 history_ctx 的路径 | `orchestrator.py`, `solver.py`, `executor.py` |
+| **ContextRouter** | 新增 RewriterContext + build_rewriter() | `contexts.py`, `router.py` |
+| **QueryRewriter** | 接收 RewriterContext，上下文感知改写查询词 | `query_rewriter.py` |
+| **Router 分类** | 短追问+有历史→不能判 trivial；direct_answer 注入历史 | `router.py`, `prompts/qa/router.py` |
+| **会话复用** | 空 session_id 自动复用最近会话 | `router_chat.py` |
+| **GSSC 全链路** | observations 送 Compressor 压缩，替换手写截断 | `orchestrator.py`, `solver.py` |
+| **监控统计** | HarnessRecorder + 累加器 + 控制台 print 输出 | `usage_store.py`, `harness/__init__.py` |
+| **情景记忆** | Episode + user_id，自动记录每次 QA，跨对话语义召回 | `episodic.py`, `supervisor.py` |
+| **前端** | sendMessage / newConversation 后刷新侧边栏 | `QAPage.vue` |
+| **杂项修复** | chromadb≥1.0.0；FTS5 残余清理；monitoring lazy import | `requirements.txt`, `vector_store.py`, `monitoring/__init__.py` |
+
+### 上下文注入修复
+
+**根因**：MemoryManager.recall() 产出的 MemoryContext.history_context 只传给了 Router，实际执行检索和合成的 Agent（DirectSolver、Planner.solve、Executor、QueryRewriter）全部拿到空 chat_history=[]。
+
+修复的 4 条路径：
+
+| 路径 | 改前 | 改后 |
+|------|------|------|
+| DirectSolver 合成 | `_build_context` 定义了但从未调用（死代码） | 注入 history_ctx 到 HumanMessage |
+| DirectSolver 改写 | `rewriter.rewrite(question)` 无历史 | `rewriter.rewrite(question, rewriter_ctx=...)` |
+| Planner.solve | SolverContext 无 history 字段 | 新增 history 字段 + to_prompt() 渲染 |
+| Router.direct_answer | `direct_answer(question)` 无上下文 | `direct_answer(question, history_ctx=...)` + prompt 规则 |
+
+### ContextRouter 扩展
+
+新增 `RewriterContext`（question + history）和 `build_rewriter()`，QueryRewriter 通过 PromptBuilder 接收类型化上下文。ContextRouter 现在管 5 种 Agent：Router / Rewriter / Solver / Planner / Reflector。
+
+### GSSC 全链路压缩
+
+**问题**：GSSC Pipeline 只接 MemoryManager，工具返回的 RAG 结果完全绕过。moderate 路径 5 次 rag_search × 5 chunk × ~800 字 = 20000+ 字符裸拼进 LLM prompt。
+
+**修复**：`QASystem._compress()` 统一压缩入口，构建 StructuredPrompt → Compressor。DirectSolver 接收 gssc_pipeline 并在合成前压缩。复杂路径主轮 + 内层修复补搜后均走 `self._compress()`。替换所有手写 `MAX_OBS_CHARS` / `[:600]` 截断。
+
+### 会话复用
+
+空 session_id 时自动查找最近 session 复用（`short_term.list_sessions()`），解决页面刷新导致新 session 的问题。日志新增 `[CHAT] session=xxx` 和 `[MEMORY] loaded N messages`。
+
+### 监控统计
+
+- `monitoring/usage_store.py`：`request_stats` 表（问答）+ `processing_stats` 表（文档处理）
+- `harness/__init__.py`：`RequestCounters` 累加器 + `begin_request()` / `finish_request()` + 控制台 `print()` 输出
+- `GET /api/monitoring/stats`：聚合查询端点
+- 控制台输出示例：`[QA] req_id | route=moderate | LLM: 3 calls, tokens=1500 | tools: 2 | latency: 3200ms`
+
+### 情景记忆 user_id
+
+`EpisodicMemory` 新增 `user_id` 字段（SQLite + ChromaDB metadata），`record(user_id=...)` 和 `recall(user_id=...)` 支持按用户过滤。`Supervisor.run()` 自动记录每次 QA 为 episode。`ChatRequest.user_id` 不传则向后兼容。
+
+### 杂项修复
+
+- `requirements.txt`：chromadb 上限从 `<1.0` → `<2.0`（最新 1.5.9 被旧上限拒绝）
+- `vector_store.py`：清理 FTS5 残余引用（`_fts_conn` → `_bm25_valid = False`）
+- `monitoring/__init__.py`：langchain_core 改为 lazy import
+- `context_builder/__init__.py`：补充导出 RewriterContext

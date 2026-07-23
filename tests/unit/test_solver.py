@@ -28,7 +28,11 @@ def config():
 
 @pytest.fixture
 def solver(config):
-    """Create a DirectSolver with mocked LLM, tools, and rewriter."""
+    """Create a DirectSolver with mocked LLM and tools.
+
+    Note: Rewriter has been moved upstream (orchestrator level).
+    Tests should pass pre-rewritten queries via normalized_queries parameter.
+    """
     agent = DirectSolver(config)
     # Replace internal components with mocks
     agent._llm = MagicMock()
@@ -263,13 +267,12 @@ class TestAnswer:
 
     @pytest.mark.asyncio
     async def test_answer_with_results(self, solver):
-        """Full pipeline with successful search and synthesis."""
-        # Mock rewriter
-        solver._rewriter.rewrite = AsyncMock(
-            return_value=["梯度下降", "优化算法"]
-        )
+        """Full pipeline with successful search and synthesis.
 
-        # Mock rag_search tool
+        Rewriter has been moved upstream (orchestrator). DirectSolver now
+        receives pre-rewritten queries via normalized_queries parameter.
+        """
+        # Mock rag_search tool — returns one result per query
         rag_mock = AsyncMock(return_value=ToolResult(
             tool_name="rag_search", query="test",
             content="some search result",
@@ -281,21 +284,37 @@ class TestAnswer:
             return_value=_make_llm_response("综合答案：梯度下降是...")
         )
 
-        result = await solver._answer("什么是梯度下降", doc_filter=None, chat_history=None)
+        result = await solver._answer(
+            "什么是梯度下降", doc_filter=None, chat_history=None,
+            normalized_queries=["梯度下降", "优化算法"],
+        )
 
         assert result["route"] == "done"
         assert "梯度下降" in result["reply"]
         assert len(result["tool_calls"]) == 2
-        # rewriter should have been called
-        solver._rewriter.rewrite.assert_called_once_with("什么是梯度下降")
 
     @pytest.mark.asyncio
     async def test_answer_no_results_but_synthesis_ok(self, solver):
-        """With empty/invalid observations, guard returns empty_result (no hallucination)."""
-        solver._rewriter.rewrite = AsyncMock(return_value=["query1"])
-        solver._tools = {}  # No tools registered → no valid observations
+        """With empty/invalid observations, guard returns empty_result (no hallucination).
 
-        result = await solver._answer("什么是梯度下降", doc_filter=None, chat_history=None)
+        The guard filters out ToolResult objects with is_error=True, empty content,
+        or content containing "未找到相关内容". So mock must return a result that
+        the guard will reject.
+        """
+        solver._tools = {
+            "rag_search": {
+                "name": "rag_search",
+                "func": AsyncMock(return_value=ToolResult(
+                    tool_name="rag_search", query="test",
+                    content="未找到相关内容",  # guard rejects this
+                )),
+            }
+        }
+
+        result = await solver._answer(
+            "什么是梯度下降", doc_filter=None, chat_history=None,
+            normalized_queries=["query1"],
+        )
 
         # Guard should refuse to synthesize with no valid observations
         assert result["route"] == "empty_result"
@@ -303,27 +322,30 @@ class TestAnswer:
 
     @pytest.mark.asyncio
     async def test_answer_escalates_when_empty(self, solver):
-        """When tools fail and no valid observations, guard returns empty_result."""
-        solver._rewriter.rewrite = AsyncMock(return_value=["query1"])
-
-        # Tool raises exception → error ToolResult, filtered out by guard
+        """Guard catches empty/invalid observations; refuses to synthesize."""
+        # All observations filtered out by guard: empty content + "未找到" marker
         solver._tools = {
             "rag_search": {
                 "name": "rag_search",
-                "func": AsyncMock(side_effect=Exception("search failed")),
+                "func": AsyncMock(return_value=ToolResult(
+                    tool_name="rag_search", query="test",
+                    content="（本地资料中未找到相关内容）",  # guard rejects
+                    error=None,
+                )),
             }
         }
 
-        result = await solver._answer("复杂问题", doc_filter=None, chat_history=None)
+        result = await solver._answer(
+            "复杂问题", doc_filter=None, chat_history=None,
+            normalized_queries=["query1"],
+        )
 
-        # Guard catches that all valid_obs are empty → empty_result (not escalate)
         assert result["route"] == "empty_result"
         assert "未找到" in result["reply"]
 
     @pytest.mark.asyncio
     async def test_answer_handles_synthesis_failure(self, solver):
         """When LLM synthesis fails, should return error reply."""
-        solver._rewriter.rewrite = AsyncMock(return_value=["query1"])
         solver._tools = {
             "rag_search": {
                 "name": "rag_search",
@@ -334,7 +356,10 @@ class TestAnswer:
         }
         solver._llm_retry = AsyncMock(side_effect=Exception("LLM down"))
 
-        result = await solver._answer("question", doc_filter=None, chat_history=None)
+        result = await solver._answer(
+            "question", doc_filter=None, chat_history=None,
+            normalized_queries=["query1"],
+        )
 
         assert "回答生成失败" in result["reply"]
 
@@ -349,7 +374,6 @@ class TestSolverRun:
     @pytest.mark.asyncio
     async def test_run_success(self, solver):
         """run() should extract question from AgentInput and return AgentOutput."""
-        solver._rewriter.rewrite = AsyncMock(return_value=["q1"])
         # Must have a working tool that returns valid content
         solver._tools = {
             "rag_search": {
@@ -367,6 +391,7 @@ class TestSolverRun:
             "question": "什么是机器学习",
             "doc_filter": None,
             "chat_history": None,
+            "normalized_queries": ["q1"],
         })
 
         result = await solver.run(inp)
@@ -376,12 +401,20 @@ class TestSolverRun:
 
     @pytest.mark.asyncio
     async def test_run_failure(self, solver):
-        """When _answer raises, run() should return AgentOutput with error."""
-        solver._rewriter.rewrite = AsyncMock(side_effect=Exception("rewriter down"))
+        """When tool lookup fails (KeyError), run() should catch it and return error.
 
-        inp = AgentInput(metadata={"question": "Q"})
+        Note: synthesis exceptions are caught inside _answer (returns graceful msg).
+        Only unhandled exceptions (e.g., tool registry KeyError) propagate to run().
+        """
+        # No tools registered → KeyError at line 85 in solver._answer
+        solver._tools = {}
+
+        inp = AgentInput(metadata={
+            "question": "Q",
+            "normalized_queries": ["q1"],
+        })
 
         result = await solver.run(inp)
 
         assert result.success is False
-        assert "rewriter down" in result.error
+        assert "rag_search" in result.error

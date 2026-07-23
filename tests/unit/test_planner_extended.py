@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from src.agents.qa.planner import Planner
 from src.config import Configuration
@@ -199,3 +200,201 @@ class TestSolve:
 
         result = await planner.solve(question="Q", observations="O")
         assert result == "fallback answer"
+
+
+# ========================================================================
+# solve — guards (empty / all-error observations)
+# ========================================================================
+
+class TestSolveGuards:
+    """solve() must refuse to call LLM when observations are empty or all errors."""
+
+    @pytest.mark.asyncio
+    async def test_empty_observations_refused(self, planner):
+        llm_mock = AsyncMock()
+        planner._llm_retry = llm_mock
+        result = await planner.solve("question", observations="")
+        assert "未找到" in result
+        llm_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_refused(self, planner):
+        llm_mock = AsyncMock()
+        planner._llm_retry = llm_mock
+        result = await planner.solve("question", observations="   \n  \n  ")
+        assert "未找到" in result
+        llm_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_all_lines_are_error_markers(self, planner):
+        llm_mock = AsyncMock()
+        planner._llm_retry = llm_mock
+        obs = "\n".join([
+            "[rag_search] 未找到相关内容",
+            "[rag_search] NOT_CONFIGURED",
+            "[rag_search] 未初始化",
+        ])
+        result = await planner.solve("question", observations=obs)
+        assert "所有检索结果均为空或失败" in result
+        llm_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_valid_and_invalid_proceeds(self, planner):
+        """At least one meaningful line → proceed to LLM."""
+        mock_resp = MagicMock()
+        mock_resp.content = "answer"
+        planner._llm_retry = AsyncMock(return_value=mock_resp)
+
+        obs = "[rag_search] 未找到相关内容\n[rag_search] 库仑定律的定义是..."
+        result = await planner.solve("question", observations=obs)
+        assert result == "answer"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_feedback_injected(self, planner):
+        """reasoning_feedback from Reflector should appear in the LLM prompt."""
+        mock_resp = MagicMock()
+        mock_resp.content = "fixed answer"
+        planner._llm_retry = AsyncMock(return_value=mock_resp)
+
+        await planner.solve(
+            "question",
+            observations="valid observation",
+            reasoning_feedback="缺少对比表格；未解释负号含义",
+        )
+
+        call_args = planner._llm_retry.call_args[0][0]
+        prompt_text = call_args[0].content
+        assert "缺少对比表格" in prompt_text
+        assert "未解释负号含义" in prompt_text
+
+
+# ========================================================================
+# _format_validation_errors
+# ========================================================================
+
+class TestFormatValidationErrors:
+    """Format Pydantic ValidationError into readable Chinese feedback for LLM retry."""
+
+    def test_formats_single_error(self):
+        from pydantic import BaseModel, Field
+        class TestModel(BaseModel):
+            name: str = Field(..., min_length=1)
+        try:
+            TestModel(name="")
+        except ValidationError as e:
+            formatted = Planner._format_validation_errors(e)
+            assert "name" in formatted
+
+    def test_formats_multiple_errors(self):
+        from pydantic import BaseModel
+        class TestModel(BaseModel):
+            a: int
+            b: str
+        try:
+            TestModel(a="not_int", b=123)
+        except ValidationError as e:
+            formatted = Planner._format_validation_errors(e)
+            assert "a" in formatted
+            assert "b" in formatted
+
+    def test_caps_at_10_errors(self):
+        """Should not produce hundreds of lines for deeply nested errors."""
+        from pydantic import BaseModel
+        class Inner(BaseModel):
+            x: int
+        class Outer(BaseModel):
+            items: list[Inner]
+        try:
+            Outer(items=[{"x": "bad"}] * 15)
+        except ValidationError as e:
+            formatted = Planner._format_validation_errors(e)
+            lines = formatted.split("\n")
+            assert len(lines) <= 10
+
+
+# ========================================================================
+# _salvage_partial
+# ========================================================================
+
+class TestSalvagePartial:
+    """Extract valid sub-questions from partially correct JSON."""
+
+    def test_none_input_returns_empty(self):
+        assert Planner._salvage_partial(None) == []
+
+    def test_empty_dict_returns_empty(self):
+        assert Planner._salvage_partial({}) == []
+
+    def test_no_sub_questions_key_returns_empty(self):
+        assert Planner._salvage_partial({"other": "data"}) == []
+
+    def test_sub_questions_not_list_returns_empty(self):
+        assert Planner._salvage_partial({"sub_questions": "not a list"}) == []
+
+    def test_valid_items_preserved(self):
+        parsed = {
+            "sub_questions": [
+                {"id": 1, "question": "什么是库仑定律",
+                 "keywords": ["库仑"], "tool": "rag_search", "depends_on": []},
+            ]
+        }
+        result = Planner._salvage_partial(parsed)
+        assert len(result) == 1
+        assert result[0]["question"] == "什么是库仑定律"
+
+    def test_skips_non_dict_entries(self):
+        parsed = {
+            "sub_questions": [
+                "not a dict",
+                {"id": 1, "question": "valid", "tool": "rag_search"},
+            ]
+        }
+        result = Planner._salvage_partial(parsed)
+        assert len(result) == 1
+
+    def test_fills_missing_id(self):
+        parsed = {"sub_questions": [{"question": "test", "tool": "rag_search"}]}
+        result = Planner._salvage_partial(parsed)
+        assert result[0]["id"] == 1
+
+    def test_fills_missing_keywords(self):
+        parsed = {"sub_questions": [{"id": 1, "question": "test", "tool": "rag_search"}]}
+        result = Planner._salvage_partial(parsed)
+        assert result[0]["keywords"] == []
+
+    def test_invalid_tool_replaced_with_default(self):
+        parsed = {"sub_questions": [{"id": 1, "question": "test", "tool": "made_up_tool"}]}
+        result = Planner._salvage_partial(parsed)
+        assert result[0]["tool"] == "rag_search"
+
+    def test_valid_tool_web_search_preserved(self):
+        parsed = {"sub_questions": [{"id": 1, "question": "test", "tool": "web_search"}]}
+        result = Planner._salvage_partial(parsed)
+        assert result[0]["tool"] == "web_search"
+
+    def test_depends_on_defaults_to_empty_list(self):
+        parsed = {"sub_questions": [{"id": 1, "question": "test", "tool": "rag_search"}]}
+        result = Planner._salvage_partial(parsed)
+        assert result[0]["depends_on"] == []
+
+
+# ========================================================================
+# _build_tool_list
+# ========================================================================
+
+class TestBuildToolList:
+    """Tool whitelist injection into Planner prompt."""
+
+    def test_includes_registered_tools(self):
+        result = Planner._build_tool_list()
+        assert "rag_search" in result or "rag_skill" in result
+
+    def test_returns_fallback_when_registry_unavailable(self):
+        with patch("src.tools.get_tool_registry", side_effect=Exception("boom")):
+            result = Planner._build_tool_list()
+            assert "rag_search" in result
+
+    def test_returns_fallback_for_empty_registry(self):
+        with patch("src.tools.get_tool_registry", return_value={}):
+            result = Planner._build_tool_list()
+            assert "rag_search" in result
