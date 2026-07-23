@@ -1,0 +1,26 @@
+[run]
+source = src
+omit =
+    src/__init__.py
+    src/agents/__init__.py
+    src/api/__init__.py
+    src/documents/__init__.py
+    src/knowledge/__init__.py
+    src/memory/__init__.py
+    src/monitoring/__init__.py
+    src/prompts/__init__.py
+    src/tools/__init__.py
+    */evaluation/*
+    src/evaluation/*.py
+    src/main.py
+    src/documents/parser.py
+    src/tools/ocr.py
+
+[report]
+fail_under = 25
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    if TYPE_CHECKING:
+    class .*\bProtocol\):

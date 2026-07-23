@@ -42,7 +42,7 @@ jobs:
 
       - name: Run unit + integration tests with coverage
         run: |
-          python -m pytest tests/unit/ tests/integration/ \
+          python -m pytest tests/unit/ tests/integration/ tests/contract/ \
             -v \
             --cov=src \
             --cov-report=term-missing \
