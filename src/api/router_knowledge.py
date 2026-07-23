@@ -310,6 +310,36 @@ async def process_knowledge(req: ProcessRequest):
             "elapsed": round(elapsed, 1),
         })
 
+        # ── Flush processing stats ──
+        try:
+            from src.monitoring.usage_store import (
+                get_recorder_store, ProcessingRecord,
+            )
+            store = get_recorder_store()
+            for fname, chap_titles in processed_chapters.items():
+                # Count chunks for this doc
+                doc_chunks = sum(
+                    1 for c in all_chunks
+                    if getattr(c, 'doc_filename', '') == fname
+                )
+                store.insert_processing(ProcessingRecord(
+                    doc_filename=fname,
+                    chapter_title=", ".join(chap_titles[:3]),
+                    operation="full",
+                    pages=0,  # not tracked here (page range handled by parser)
+                    chunks=doc_chunks,
+                    llm_calls=0,   # captured by token_usage.db via harness hooks
+                    total_tokens=0,
+                    latency_ms=round(elapsed * 1000),
+                ))
+            logger.info(
+                "[STATS] processing flushed: %d files, %d chapters, %d chunks, %.1fs",
+                len(processed_chapters), len(documents),
+                len(all_chunks), elapsed,
+            )
+        except Exception as e:
+            logger.warning("Failed to flush processing stats: %s", e)
+
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",

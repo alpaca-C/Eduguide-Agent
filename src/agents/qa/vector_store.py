@@ -153,7 +153,7 @@ class DocumentVectorStore:
             pass  # BM25 rebuilt on next search
         except Exception as e:
             logger.warning("ChromaDB delete doc '%s' failed: %s", doc_filename, e)
-        logger.info("ChromaDB+FTS: removed %d chunks for '%s', %d remaining", removed, doc_filename, len(self._all_texts))
+        logger.info("ChromaDB+BM25: removed %d chunks for '%s', %d remaining", removed, doc_filename, len(self._all_texts))
 
     def remove_by_chapter(self, doc_filename: str, chapter_title: str) -> int:
         """Remove all chunks belonging to a specific chapter (granular delete).
@@ -180,7 +180,7 @@ class DocumentVectorStore:
             self._collection.delete(ids=ids_to_delete)
             pass  # BM25 rebuilt on next search
         except Exception as e:
-            logger.warning("ChromaDB+FTS chapter delete failed: %s", e)
+            logger.warning("ChromaDB+BM25 chapter delete failed: %s", e)
             return 0
 
         # Rebuild in-memory state from ChromaDB (source of truth)
@@ -279,19 +279,10 @@ class DocumentVectorStore:
         self._collection.add(ids=new_ids, documents=new_texts, metadatas=new_metas, embeddings=embeddings)
 
         # Sparse: invalidate BM25 index — rebuilt lazily on next search
-        # (OCR often inserts spaces between Chinese characters, breaking tokenization)
-        def _normalize_cjk(text: str) -> str:
-            import re
-            return re.sub(r'(?<=[一-鿿]) +(?=[一-鿿])', '', text)
-        fts_rows = [(cid, _normalize_cjk(t), m["doc_filename"], m["chapter_title"])
-                      for cid, t, m in zip(new_ids, new_texts, new_metas)]
-        self._fts_conn.executemany(
-            "INSERT INTO chunk_fts (chunk_id, text, doc_filename, chapter_title) VALUES (?, ?, ?, ?)",
-            fts_rows,
-        )
-        self._fts_conn.commit()
+        self._bm25_valid = False
 
-        logger.info("ChromaDB+FTS: +%d new (skipped %d), total %d", len(new_ids), skipped, len(self._all_texts))
+        logger.info("ChromaDB+BM25: +%d new (skipped %d), total %d",
+                     len(new_ids), skipped, len(self._all_texts))
 
     # ── Dense search ───────────────────────────────────────────
 

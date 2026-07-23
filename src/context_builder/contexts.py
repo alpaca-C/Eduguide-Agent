@@ -19,6 +19,21 @@ class BaseContext(ABC):
         ...
 
 
+# ── Rewriter ────────────────────────────────────────────────────────────────
+
+@dataclass
+class RewriterContext(BaseContext):
+    """Context for QueryRewriter — NL → search keywords with history awareness."""
+    question: str
+    history: str = ""              # recent conversation for context-aware rewriting
+
+    def to_prompt(self) -> str:
+        parts = []
+        if self.history.strip():
+            parts.append(f"### 对话历史\n{self.history}")
+        return "\n\n".join(parts)
+
+
 # ── Router ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -41,15 +56,18 @@ class RouterContext(BaseContext):
 
 @dataclass
 class SolverContext(BaseContext):
-    """Context for DirectSolver — search + synthesize."""
+    """Context for DirectSolver / Planner.solve — search + synthesize."""
     question: str
     plan: list[dict] = field(default_factory=list)       # sub-questions to search
     observations: str = ""          # retrieved document chunks
+    history: str = ""              # conversation history (compressed)
     evidence: list[str] = field(default_factory=list)    # key evidence snippets
     citations: list[str] = field(default_factory=list)   # source references
 
     def to_prompt(self) -> str:
         parts = []
+        if self.history.strip():
+            parts.append(f"### 对话历史\n{self.history}")
         if self.plan:
             plan_text = "\n".join(
                 f"- {s.get('id', i+1)}. {s.get('question', '')}"

@@ -13,6 +13,7 @@ from ...config import Configuration
 from ...prompts.qa.router import SYSTEM_PROMPT
 from ...prompts.qa.reflector import REFLECT_PROMPT
 from ...context_builder import ReflectorContext, PromptBuilder
+from ...context_builder.schema import StructuredPrompt
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +34,11 @@ class Reflector(BaseAgent):
         question = input.metadata.get("question", "")
         answer = input.metadata.get("answer", "")
         observations = input.metadata.get("observations", "")
+        structured = input.metadata.get("structured_prompt")
 
         try:
-            verdict = await self.review(question, answer, observations)
+            verdict = await self.review(question, answer, observations,
+                                        structured_prompt=structured)
             return AgentOutput(success=True, metadata=verdict)
         except Exception as e:
             logger.error("Reflector review failed: %s", e)
@@ -47,13 +50,19 @@ class Reflector(BaseAgent):
             })
 
     async def review(self, question: str, answer: str, observations: str,
-                     history_ctx: str = "", reflector_ctx: ReflectorContext | None = None) -> dict:
+                     history_ctx: str = "", reflector_ctx: ReflectorContext | None = None,
+                     structured_prompt: StructuredPrompt | None = None) -> dict:
         """Return structured verdict with gaps and suggested search queries."""
         system_prompt = SYSTEM_PROMPT + "\n\n" + REFLECT_PROMPT.format(
             question=question, answer=answer, observations=observations,
         )
 
-        if reflector_ctx is not None:
+        if structured_prompt is not None:
+            messages = [
+                SystemMessage(content=system_prompt + "\n\n" + structured_prompt.to_prompt()),
+                HumanMessage(content="请判断回答是否充分。"),
+            ]
+        elif reflector_ctx is not None:
             messages = PromptBuilder.build(
                 system=system_prompt,
                 context=reflector_ctx,

@@ -110,7 +110,7 @@ class TestOrchestratorModerate:
             qa = QASystem(mock_config)
             qa._router._llm_retry = _make_fake_retry(ROUTER_MODERATE_JSON)
             qa._solver._llm_retry = _make_fake_retry("综合答案：库仑定律是...")
-            qa._solver._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
+            qa._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
 
             result = await qa.answer(
                 "什么是库仑定律？", doc_filter=None, chat_history=None,
@@ -168,7 +168,7 @@ class TestOrchestratorEdgeCases:
             qa = QASystem(mock_config)
             qa._router._llm_retry = _make_fake_retry("bad json {{")
             qa._solver._llm_retry = _make_fake_retry("兜底答案")
-            qa._solver._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
+            qa._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
 
             result = await qa.answer(
                 "随机问题", doc_filter=None, chat_history=None,
@@ -189,6 +189,7 @@ class TestOrchestratorEdgeCases:
 
             qa = QASystem(mock_config)
             qa._router._llm_retry = _make_fake_retry(ROUTER_TRIVIAL_JSON)
+            qa._rewriter._llm_retry = _make_fake_retry(REWRITER_OUTPUT)
 
             history = [
                 {"role": "user", "content": "什么是电场？"},

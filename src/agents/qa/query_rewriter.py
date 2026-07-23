@@ -12,6 +12,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from ..base import BaseAgent, AgentInput, AgentOutput
 from ...config import Configuration
 from ...prompts.qa.query_rewriter import REWRITE_PROMPT
+from ...context_builder import RewriterContext, PromptBuilder
+from ...context_builder.schema import StructuredPrompt
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +21,8 @@ logger = logging.getLogger(__name__)
 class QueryRewriter(BaseAgent):
     """Expands a student question into 3-5 search-optimized keywords.
 
+    Accepts StructuredPrompt (GSSC, preferred), RewriterContext (typed), or raw history.
     Cost: 1 fast LLM call (~200 tokens output). Adds ~1s latency.
-    Benefit: Significantly improves FTS5 and KG recall for Chinese questions.
     """
 
     def __init__(self, config: Configuration):
@@ -29,19 +31,57 @@ class QueryRewriter(BaseAgent):
 
     async def run(self, input: AgentInput) -> AgentOutput:
         question = input.metadata.get("question", "")
+        structured = input.metadata.get("structured_prompt")
+        rewriter_ctx = input.metadata.get("rewriter_context")
         try:
-            queries = await self.rewrite(question)
+            queries = await self.rewrite(question, structured_prompt=structured,
+                                         rewriter_ctx=rewriter_ctx)
             return AgentOutput(success=True, metadata={"queries": queries})
         except Exception as e:
             logger.warning("QueryRewriter failed: %s, using original question", e)
             return AgentOutput(success=True, metadata={"queries": [question]})
 
-    async def rewrite(self, question: str) -> list[str]:
-        """Generate 3-5 optimized search queries from a natural language question."""
-        resp = await self._llm_retry([
-            SystemMessage(content=REWRITE_PROMPT.format(question=question)),
-            HumanMessage(content="请生成搜索查询词。"),
-        ])
+    async def rewrite(self, question: str,
+                      rewriter_ctx: RewriterContext | None = None,
+                      history: str = "",
+                      structured_prompt: StructuredPrompt | None = None) -> list[str]:
+        """Generate 3-5 optimized search queries from a natural language question.
+
+        Args:
+            question: The student's question.
+            structured_prompt: GSSC StructuredPrompt (preferred).
+            rewriter_ctx: Typed RewriterContext (legacy).
+            history: Legacy raw history string (fallback).
+        """
+        if structured_prompt is not None:
+            messages = [
+                SystemMessage(content=REWRITE_PROMPT.format(question=question)
+                              + "\n\n" + structured_prompt.to_prompt()),
+                HumanMessage(content="请基于上下文生成搜索查询词。"),
+            ]
+        elif rewriter_ctx is not None:
+            messages = PromptBuilder.build(
+                system=REWRITE_PROMPT.format(question=question),
+                context=rewriter_ctx,
+                user="请基于对话上下文生成搜索查询词。",
+            )
+        elif history:
+            prompt = REWRITE_PROMPT.replace(
+                "**学生问题：** {question}",
+                f"**对话历史：**\n{history}\n\n**学生问题：** {{question}}",
+            ).format(question=question)
+            messages = [
+                SystemMessage(content=prompt),
+                HumanMessage(content="请生成搜索查询词。"),
+            ]
+        else:
+            prompt = REWRITE_PROMPT.format(question=question)
+            messages = [
+                SystemMessage(content=prompt),
+                HumanMessage(content="请生成搜索查询词。"),
+            ]
+
+        resp = await self._llm_retry(messages)
         text = resp.content if hasattr(resp, "content") else str(resp)
         return self._parse_queries(text, question)
 

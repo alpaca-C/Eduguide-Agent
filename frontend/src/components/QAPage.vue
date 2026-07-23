@@ -61,6 +61,7 @@ async function sendMessage() {
       body: JSON.stringify({
         question,
         session_id: chat.sessionId,
+        user_id: chat.userId,
         doc_filter: docFilter.value,
         tutor_mode: tutorMode.value,
       }),
@@ -87,7 +88,10 @@ async function sendMessage() {
       }
     })
 
-    if (finalSid) chat.sessionId = finalSid
+    if (finalSid) {
+      chat.sessionId = finalSid
+      chat.refreshSessions()  // update sidebar with the new session
+    }
     if (!replyStarted) {
       thinking.value = ''
       messages.value.push({ role: 'assistant', content: '抱歉，无法生成回答。' })
@@ -108,6 +112,7 @@ async function sendMessage() {
 function newConversation() {
   chat.newConversation()
   messages.value = []
+  chat.refreshSessions()
 }
 
 async function loadSession(sid) {

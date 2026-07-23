@@ -1,5 +1,10 @@
 # ContextRouter — builds agent-specific typed contexts from MemoryContext.
 #
+# DEPRECATED: GSSCPipeline.run() now produces StructuredPrompt with all
+# sections (role_policies, task, state, evidence, context, output_format).
+# Each agent reads what it needs directly. ContextRouter is kept only as
+# a fallback when GSSC is unavailable (e.g. CI).
+#
 # Different agents need different slices of memory. The ContextRouter
 # extracts the right fields from MemoryContext + runtime state and
 # packages them into the typed context dataclass for each agent.
@@ -9,7 +14,8 @@ from __future__ import annotations
 import logging
 
 from .contexts import (
-    RouterContext, SolverContext, PlannerContext, ReflectorContext, BaseContext,
+    RouterContext, SolverContext, PlannerContext, ReflectorContext,
+    RewriterContext, BaseContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,12 +43,29 @@ class ContextRouter:
             user_intent=user_intent,
         )
 
+    def build_rewriter(
+        self,
+        question: str,
+        memory_context=None,
+        history_ctx: str = "",
+    ) -> RewriterContext:
+        """Build context for QueryRewriter — NL → search keywords.
+
+        Extracts conversation history from memory_context (preferred)
+        or falls back to the raw history_ctx string.
+        """
+        history = history_ctx
+        if not history and memory_context is not None:
+            history = getattr(memory_context, 'history_context', '')
+        return RewriterContext(question=question, history=history)
+
     def build_solver(
         self,
         question: str,
         plan: list[dict] | None = None,
         search_results: list | None = None,
         doc_filter: set[str] | None = None,
+        history_ctx: str = "",
     ) -> SolverContext:
         """Build context for DirectSolver — search + synthesize."""
         observations, evidence, citations = self._extract_from_results(search_results)
@@ -51,6 +74,7 @@ class ContextRouter:
             question=question,
             plan=plan or [],
             observations=observations,
+            history=history_ctx,
             evidence=evidence,
             citations=citations,
         )

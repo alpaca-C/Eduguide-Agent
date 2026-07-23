@@ -36,7 +36,28 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Episode:
-    """A single recorded experience in episodic memory."""
+    """A single recorded experience in episodic memory.
+
+    Core fields (always populated):
+        id, task_goal, task_type, context, actions, observations, outcome,
+        reflection, session_id, user_id, created_at
+
+    Diagnosis fields (populated when Reflector provides feedback):
+        failure_stage: "router" | "rewriter" | "planner.plan" | "executor"
+                      | "planner.solve" | "none"
+        insufficiency_type: "plan" | "knowledge" | "reasoning" | ""
+        missing_aspects: what the answer was missing
+        suggested_queries: Reflector's suggested search terms
+
+    Lesson fields (human-readable insights):
+        lesson: one-line takeaway
+        corrected_behavior: what to do differently next time
+        good_pattern: what went well (positive reinforcement)
+
+    Matching fields (for semantic recall quality):
+        question_pattern: abstracted question pattern ("物理公式推导")
+        keywords: matching keywords extracted from the question
+    """
     id: str
     task_goal: str
     task_type: str = ""
@@ -46,7 +67,23 @@ class Episode:
     outcome: dict = field(default_factory=dict)
     reflection: dict = field(default_factory=dict)
     session_id: str = ""
+    user_id: str = ""
     created_at: float = 0.0
+
+    # ── Diagnosis (from Reflector verdict) ──
+    failure_stage: str = ""
+    insufficiency_type: str = ""       # "plan" | "knowledge" | "reasoning"
+    missing_aspects: list[str] = field(default_factory=list)
+    suggested_queries: list[str] = field(default_factory=list)
+
+    # ── Lessons (structured insights) ──
+    lesson: str = ""
+    corrected_behavior: str = ""
+    good_pattern: str = ""
+
+    # ── Matching ──
+    question_pattern: str = ""
+    keywords: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -59,31 +96,61 @@ class Episode:
             "outcome": self.outcome,
             "reflection": self.reflection,
             "session_id": self.session_id,
+            "user_id": self.user_id,
             "created_at": self.created_at,
+            "failure_stage": self.failure_stage,
+            "insufficiency_type": self.insufficiency_type,
+            "missing_aspects": self.missing_aspects,
+            "suggested_queries": self.suggested_queries,
+            "lesson": self.lesson,
+            "corrected_behavior": self.corrected_behavior,
+            "good_pattern": self.good_pattern,
+            "question_pattern": self.question_pattern,
+            "keywords": self.keywords,
         }
 
     @classmethod
     def from_row(cls, row: tuple) -> "Episode":
+        """Reconstruct from SQLite row. Handles both old (11-col) and new (20-col) rows."""
+        n = len(row)
         return cls(
             id=row[0],
             task_goal=row[1],
-            task_type=row[2],
-            context=json.loads(row[3]) if row[3] else {},
-            actions=json.loads(row[4]) if row[4] else [],
-            observations=json.loads(row[5]) if row[5] else [],
-            outcome=json.loads(row[6]) if row[6] else {},
-            reflection=json.loads(row[7]) if row[7] else {},
-            session_id=row[8] or "",
-            created_at=row[9],
+            task_type=row[2] if n > 2 else "",
+            context=json.loads(row[3]) if n > 3 and row[3] else {},
+            actions=json.loads(row[4]) if n > 4 and row[4] else [],
+            observations=json.loads(row[5]) if n > 5 and row[5] else [],
+            outcome=json.loads(row[6]) if n > 6 and row[6] else {},
+            reflection=json.loads(row[7]) if n > 7 and row[7] else {},
+            session_id=row[8] if n > 8 else "",
+            user_id=row[9] if n > 9 else "",
+            created_at=row[10] if n > 10 else 0.0,
+            # New fields (columns 11-19, nullable)
+            failure_stage=row[11] if n > 11 else "",
+            insufficiency_type=row[12] if n > 12 else "",
+            missing_aspects=json.loads(row[13]) if n > 13 and row[13] else [],
+            suggested_queries=json.loads(row[14]) if n > 14 and row[14] else [],
+            lesson=row[15] if n > 15 else "",
+            corrected_behavior=row[16] if n > 16 else "",
+            good_pattern=row[17] if n > 17 else "",
+            question_pattern=row[18] if n > 18 else "",
+            keywords=json.loads(row[19]) if n > 19 and row[19] else [],
         )
 
     def _search_text(self) -> str:
         """Build the searchable text for vector embedding."""
         parts = [self.task_goal]
         parts.extend(self.observations)
-        lesson = self.reflection.get("lesson", "")
-        if lesson:
-            parts.append(lesson)
+        # Prefer structured lesson field (new), fall back to reflection dict (legacy)
+        lesson_text = self.lesson or self.reflection.get("lesson", "")
+        if lesson_text:
+            parts.append(lesson_text)
+        if self.corrected_behavior:
+            parts.append(self.corrected_behavior)
+        if self.question_pattern:
+            parts.append(self.question_pattern)
+        if self.keywords:
+            parts.extend(self.keywords)
         return " ".join(parts)
 
 
@@ -130,11 +197,32 @@ class EpisodicMemory:
                     outcome_json TEXT DEFAULT '{}',
                     reflection_json TEXT DEFAULT '{}',
                     session_id TEXT DEFAULT '',
+                    user_id TEXT DEFAULT '',
                     created_at REAL NOT NULL
                 )
             """)
+            # Migrations: add columns that may not exist in older DBs
+            migrations = [
+                "ALTER TABLE episodes ADD COLUMN user_id TEXT DEFAULT ''",
+                "ALTER TABLE episodes ADD COLUMN failure_stage TEXT DEFAULT ''",
+                "ALTER TABLE episodes ADD COLUMN insufficiency_type TEXT DEFAULT ''",
+                "ALTER TABLE episodes ADD COLUMN missing_aspects_json TEXT DEFAULT '[]'",
+                "ALTER TABLE episodes ADD COLUMN suggested_queries_json TEXT DEFAULT '[]'",
+                "ALTER TABLE episodes ADD COLUMN lesson TEXT DEFAULT ''",
+                "ALTER TABLE episodes ADD COLUMN corrected_behavior TEXT DEFAULT ''",
+                "ALTER TABLE episodes ADD COLUMN good_pattern TEXT DEFAULT ''",
+                "ALTER TABLE episodes ADD COLUMN question_pattern TEXT DEFAULT ''",
+                "ALTER TABLE episodes ADD COLUMN keywords_json TEXT DEFAULT '[]'",
+            ]
+            for m in migrations:
+                try:
+                    conn.execute(m)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ep_task_type ON episodes(task_type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ep_created ON episodes(created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ep_user ON episodes(user_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ep_failure_stage ON episodes(failure_stage)")
             conn.commit()
 
     # ── ChromaDB (lazy init, best-effort) ────────────────────────────────
@@ -234,7 +322,8 @@ class EpisodicMemory:
 
     # ── Public API ──────────────────────────────────────────────────────
 
-    def record(self, episode_dict: dict, session_id: str = "") -> str:
+    def record(self, episode_dict: dict, session_id: str = "",
+               user_id: str = "") -> str:
         """Record a new episode. Returns the episode ID.
 
         Args:
@@ -245,8 +334,24 @@ class EpisodicMemory:
                 "observations": ["...", "..."],
                 "outcome": {"decision": "...", "success": true},
                 "reflection": {"lesson": "...", "avoid": "..."},
+
+                # ── New diagnosis fields (from Reflector) ──
+                "failure_stage": "planner.plan",
+                "insufficiency_type": "plan",
+                "missing_aspects": ["未解释负号物理意义"],
+                "suggested_queries": ["楞次定律 负号"],
+
+                # ── New lesson fields ──
+                "lesson": "遇到推导题要保留公式子问题",
+                "corrected_behavior": "分解时显式检查公式/推导维度",
+                "good_pattern": "Dense 单路就命中了",
+
+                # ── New matching fields ──
+                "question_pattern": "物理公式推导",
+                "keywords": ["库仑定律", "高斯定理"],
             }
             session_id: Optional session this episode belongs to.
+            user_id: Optional user identifier for cross-session recall.
 
         Returns:
             The generated episode ID (e.g. "ep_001").
@@ -262,7 +367,18 @@ class EpisodicMemory:
             outcome=episode_dict.get("outcome", {}),
             reflection=episode_dict.get("reflection", {}),
             session_id=session_id,
+            user_id=user_id,
             created_at=time.time(),
+            # New fields
+            failure_stage=episode_dict.get("failure_stage", ""),
+            insufficiency_type=episode_dict.get("insufficiency_type", ""),
+            missing_aspects=episode_dict.get("missing_aspects", []),
+            suggested_queries=episode_dict.get("suggested_queries", []),
+            lesson=episode_dict.get("lesson", ""),
+            corrected_behavior=episode_dict.get("corrected_behavior", ""),
+            good_pattern=episode_dict.get("good_pattern", ""),
+            question_pattern=episode_dict.get("question_pattern", ""),
+            keywords=episode_dict.get("keywords", []),
         )
 
         # 1) SQLite
@@ -271,8 +387,13 @@ class EpisodicMemory:
                 """INSERT OR REPLACE INTO episodes
                    (id, task_goal, task_type, context_json, actions_json,
                     observations_json, outcome_json, reflection_json,
-                    session_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    session_id, user_id, created_at,
+                    failure_stage, insufficiency_type,
+                    missing_aspects_json, suggested_queries_json,
+                    lesson, corrected_behavior, good_pattern,
+                    question_pattern, keywords_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ep.id, ep.task_goal, ep.task_type,
                     json.dumps(ep.context, ensure_ascii=False),
@@ -280,7 +401,14 @@ class EpisodicMemory:
                     json.dumps(ep.observations, ensure_ascii=False),
                     json.dumps(ep.outcome, ensure_ascii=False),
                     json.dumps(ep.reflection, ensure_ascii=False),
-                    ep.session_id, ep.created_at,
+                    ep.session_id, ep.user_id, ep.created_at,
+                    # New fields
+                    ep.failure_stage, ep.insufficiency_type,
+                    json.dumps(ep.missing_aspects, ensure_ascii=False),
+                    json.dumps(ep.suggested_queries, ensure_ascii=False),
+                    ep.lesson, ep.corrected_behavior, ep.good_pattern,
+                    ep.question_pattern,
+                    json.dumps(ep.keywords, ensure_ascii=False),
                 ),
             )
             conn.commit()
@@ -297,6 +425,9 @@ class EpisodicMemory:
                         "task_goal": ep.task_goal[:200],
                         "task_type": ep.task_type,
                         "session_id": session_id,
+                        "user_id": user_id,
+                        "failure_stage": ep.failure_stage,
+                        "insufficiency_type": ep.insufficiency_type,
                     }],
                 )
         except Exception as e:
@@ -305,7 +436,8 @@ class EpisodicMemory:
         logger.info("EpisodicMemory: recorded episode '%s' — '%s'", ep.id, ep.task_goal[:60])
         return ep.id
 
-    def recall(self, query: str, top_k: int = 5) -> list[Episode]:
+    def recall(self, query: str, top_k: int = 5,
+               user_id: str = "") -> list[Episode]:
         """Semantic recall of relevant past episodes.
 
         Searches ChromaDB for episodes similar to the query,
@@ -314,6 +446,8 @@ class EpisodicMemory:
         Args:
             query: Natural language query (e.g. "RAG检索优化").
             top_k: Max episodes to return.
+            user_id: Optional user filter — only returns this user's episodes.
+                     Empty string = no filter (backward compatible).
 
         Returns:
             List of Episode objects, most relevant first.
@@ -322,9 +456,15 @@ class EpisodicMemory:
             self._ensure_chroma()
             if not self._collection or self._collection is False:
                 return []  # ChromaDB unavailable, no semantic recall
+
+            where_filter = None
+            if user_id:
+                where_filter = {"user_id": user_id}
+
             results = self._collection.query(
                 query_texts=[query],
                 n_results=top_k,
+                where=where_filter,
                 include=["metadatas", "distances"],
             )
             ids = results.get("ids", [[]])[0]
@@ -357,19 +497,24 @@ class EpisodicMemory:
                 return Episode.from_row(row)
         return None
 
-    def list(self, task_type: str = "", limit: int = 20) -> list[Episode]:
-        """List recent episodes, optionally filtered by task_type."""
+    def list(self, task_type: str = "", user_id: str = "",
+             limit: int = 20) -> list[Episode]:
+        """List recent episodes, optionally filtered by task_type and/or user_id."""
         with sqlite3.connect(self._db_path) as conn:
+            conditions = []
+            params: list = []
             if task_type:
-                rows = conn.execute(
-                    "SELECT * FROM episodes WHERE task_type = ? ORDER BY created_at DESC LIMIT ?",
-                    (task_type, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM episodes ORDER BY created_at DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
+                conditions.append("task_type = ?")
+                params.append(task_type)
+            if user_id:
+                conditions.append("user_id = ?")
+                params.append(user_id)
+            where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            params.append(limit)
+            rows = conn.execute(
+                f"SELECT * FROM episodes {where} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
         return [Episode.from_row(r) for r in rows]
 
     def delete(self, episode_id: str):

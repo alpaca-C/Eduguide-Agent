@@ -16,6 +16,12 @@ omit = [
     "src/monitoring/__init__.py",
     "src/prompts/__init__.py",
     "src/tools/__init__.py",
+    # CLI tools / evaluation — not part of QA runtime
+    "src/evaluation/*",
+    "src/main.py",
+    # External IO only — mock cost >> value
+    "src/documents/parser.py",
+    "src/tools/ocr.py",
 ]
 
 [tool.coverage.report]

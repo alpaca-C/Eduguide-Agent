@@ -27,8 +27,17 @@ class ProblemSolveSkill(Skill):
     def description(self) -> str:
         return (
             "完整的教材答疑流程：问题分类 → 多步规划 → 并发检索 → 结果综合 → 反思审核。"
-            "适合所有需要基于教材回答的问题。"
+            "适合所有需要基于教材回答的问题，包括概念定义、公式推导、跨章节比较、综合应用等。"
         )
+
+    @property
+    def examples(self) -> list[str]:
+        return [
+            "什么是库仑定律",
+            "高斯定理怎么从库仑定律推导",
+            "电场强度和电势有什么区别",
+            "麦克斯韦方程组包含哪四个方程",
+        ]
 
     async def execute(self, input: SkillInput) -> SkillOutput:
         """Execute the full QA pipeline.
@@ -41,6 +50,8 @@ class ProblemSolveSkill(Skill):
         doc_filter = input.params.get("doc_filter")
         tutor_mode = input.params.get("tutor_mode", False)
         chat_history = input.params.get("chat_history", [])
+        session_id = input.params.get("session_id", "")
+        user_id = input.params.get("user_id", "")
         memory_ctx = input.memory_context
 
         try:
@@ -50,6 +61,8 @@ class ProblemSolveSkill(Skill):
                 chat_history=chat_history,
                 memory_context=memory_ctx,
                 tutor_mode=tutor_mode,
+                session_id=session_id,
+                user_id=user_id,
             )
             return SkillOutput(
                 reply=result.get("reply", ""),

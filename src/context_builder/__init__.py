@@ -22,6 +22,7 @@ from .compress import Compressor
 from .pipeline import GSSCPipeline
 from .contexts import (
     BaseContext,
+    RewriterContext,
     RouterContext,
     SolverContext,
     PlannerContext,
@@ -43,6 +44,7 @@ __all__ = [
     "Compressor",
     # Typed contexts
     "BaseContext",
+    "RewriterContext",
     "RouterContext",
     "SolverContext",
     "PlannerContext",

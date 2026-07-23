@@ -1,32 +1,33 @@
 # QA Orchestrator — 3-tier routing with conversation memory
 #
-# Tier 0: trivial  → direct answer (1 LLM)
-# Tier 1: moderate → DirectSolver (2-3 LLM)
-# Tier 2: complex  → Planner→Executor→Reflector loop (≤3 rounds)
+# Rewriter runs first (normalizes question for better classification),
+# then Router classifies by task structure (parallel→moderate, sequential→complex).
+# Moderate uses concurrent RAG (asyncio.gather). Complex unchanged.
 #
-# Conversation memory:
-#   chat_history is loaded from SQLite per session and passed to all sub-agents.
-#   When history exceeds COMPRESS_THRESHOLD messages, older turns are compressed
-#   into a summary to stay within the model's context window.
+# Tier 0: trivial  → direct answer (1 LLM)
+# Tier 1: moderate → DirectSolver (concurrent RAG + synthesize)
+# Tier 2: complex  → Planner→Executor→Reflector loop (≤3 rounds)
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from ...config import Configuration
-from ...tools import ToolResult
-from ...context_builder import ContextRouter, RouterContext, PlannerContext, SolverContext, ReflectorContext
+from ...tools import ToolResult, get_tool_registry
+from ...context_builder import ContextRouter  # deprecated, kept for fallback
+from ...context_builder.schema import StructuredPrompt
 
 from .router import QuestionRouter
 from .solver import DirectSolver
 from .planner import Planner
 from .executor import Executor
 from .reflector import Reflector
+from .query_rewriter import QueryRewriter
 
 logger = logging.getLogger(__name__)
 
 MAX_COMPLEX_ROUNDS = 3
-MAX_MODERATE_ROUNDS = 2
 MAX_INLINE_FIXES = 2      # Max inline knowledge/reasoning fixes per complex round
 MAX_HISTORY_CHARS = 4000  # Max chars of chat_history to inject into prompts
 COMPRESS_THRESHOLD = 12   # Messages before compressing older ones into summary
@@ -36,16 +37,19 @@ MAX_OBS_CHARS = 6000      # Max chars of accumulated observations
 class QASystem:
     """Orchestrates the 5-agent QA pipeline with 3-tier difficulty routing."""
 
-    def __init__(self, config: Configuration, gssc_pipeline=None, rag_skill=None):
+    def __init__(self, config: Configuration, gssc_pipeline=None, rag_skill=None,
+                 memory_manager=None):
         self._config = config
         self._router = QuestionRouter(config)
-        self._solver = DirectSolver(config)
+        self._solver = DirectSolver(config, gssc_pipeline=gssc_pipeline)
         self._planner = Planner(config)
         self._executor = Executor(config)
         self._reflector = Reflector(config)
-        self._gssc = gssc_pipeline  # GSSC context builder (optional)
-        self._ctx_router = ContextRouter()  # typed context builder
-        self._rag_skill = rag_skill  # RAG retrieval skill (optional)
+        self._rewriter = QueryRewriter(config)  # runs before Router for all questions
+        self._gssc = gssc_pipeline        # GSSC Gather→Select→Structure→Compress
+        self._ctx_router = ContextRouter()  # deprecated, fallback when GSSC unavailable
+        self._rag_skill = rag_skill
+        self._memory = memory_manager      # MemoryManager, for _record_episode()
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -54,49 +58,129 @@ class QASystem:
         doc_filter: set[str] | None = None,
         chat_history: list[dict] | None = None,
         memory_context: object = None,  # MemoryContext from MemoryManager.recall()
-        tutor_mode: bool = False,
+        tutor_mode: bool = False,       # ignored — routing done by Supervisor
+        session_id: str = "",
+        user_id: str = "",              # for episodic memory recording
     ) -> dict:
-        """Main entry point. Returns {reply, rounds, tool_calls, route}."""
-        # ── "举一反三" exercise tutor mode ──
-        if tutor_mode:
-            return await self._handle_tutor(question, doc_filter, chat_history)
+        """Main entry point. Returns {reply, rounds, tool_calls, route}.
 
-        # Build RouterContext via ContextRouter
-        router_ctx = self._ctx_router.build_router(question, memory_context)
-
-        # Build legacy history_ctx for fallback/compat
+        Flow: Rewriter (normalize) → Router (classify) → dispatch.
+        """
+        self._user_id = user_id  # stored for _record_episode in sub-paths
+        # Build legacy history_ctx
         if memory_context is not None and hasattr(memory_context, 'history_context'):
             history_ctx = memory_context.history_context
         else:
             history_ctx = self._build_history_context(chat_history)
 
-        # Tier 0: Classify difficulty (with typed context)
-        route_result = await self._router.run(self._mk_input(
-            question=question,
-            chat_history=history_ctx,         # legacy compat
-            router_context=router_ctx,         # typed context
-        ))
+        # ── ① Rewriter + Router: run concurrently (no dependency) ──
+        # Router classifies without rewriter keywords — the question + GSSC
+        # context + history is sufficient. Rewriter keywords still feed into
+        # moderate path's RAG search.
+        rewriter_task = self._run_rewriter(
+            question, history_ctx, memory_context, session_id,
+        )
+        router_task = self._route_question(
+            question, history_ctx, memory_context, session_id,
+        )
+        normalized_queries, route_result = await asyncio.gather(
+            rewriter_task, router_task,
+        )
         difficulty = route_result.metadata.get("difficulty", "moderate")
 
         # Trivial: direct answer
         if difficulty == "trivial":
-            reply = await self._router.direct_answer(question)
+            reply = await self._router.direct_answer(question, history_ctx=history_ctx)
+            self._record_episode(question, "trivial", [], 0, True, session_id=session_id)
             return {"reply": reply, "rounds": 0, "tool_calls": [], "route": "trivial"}
 
-        # Reuse Router's decomposition as seed for Planner (both paths)
-        seed_decomposition = route_result.metadata.get("decomposition", [])
+        # Router decomposition → moderate execution plan / complex seed
+        decomposition = route_result.metadata.get("decomposition", [])
 
-        # Moderate: DirectSolver
+        # Moderate: concurrent RAG
         if difficulty == "moderate":
-            return await self._handle_moderate(question, doc_filter, chat_history,
-                                               seed_decomposition=seed_decomposition,
-                                               history_ctx=history_ctx)
+            return await self._handle_moderate(
+                question, doc_filter, chat_history,
+                decomposition=decomposition,
+                normalized_queries=normalized_queries,
+                history_ctx=history_ctx,
+                memory_context=memory_context,
+                session_id=session_id,
+            )
 
-        # Complex: Planner pipeline
+        # Complex: Planner pipeline (unchanged, seed_decomposition preserved)
         return await self._handle_complex(question, doc_filter, chat_history,
-                                          seed_decomposition=seed_decomposition,
+                                          seed_decomposition=decomposition,
                                           history_ctx=history_ctx,
-                                          memory_context=memory_context)
+                                          memory_context=memory_context,
+                                          session_id=session_id)
+
+    # ── GSSC context builder helpers ───────────────────────────────
+
+    async def _build_structured(
+        self, question: str, memory_context=None, session_id: str = "",
+        difficulty: str = "", current_round: int = 0,
+        feedback: str = "", planner_output=None, search_results=None,
+        current_answer: str = "",
+    ) -> StructuredPrompt | None:
+        """Run GSSC pipeline to build structured context. Returns None if GSSC unavailable."""
+        if self._gssc is None:
+            return None
+        try:
+            return await self._gssc.run(
+                question=question,
+                session_id=session_id,
+                difficulty=difficulty,
+                current_round=current_round,
+                feedback=feedback,
+                planner_output=planner_output,
+                search_results=search_results,
+                current_answer=current_answer,
+                memory_context=memory_context,
+            )
+        except Exception as e:
+            logger.warning("GSSC pipeline failed, falling back to legacy: %s", e)
+            return None
+
+    async def _run_rewriter(
+        self, question: str, history_ctx: str, memory_context=None, session_id: str = "",
+    ) -> list[str]:
+        """Run QueryRewriter before Router. Returns 3-5 normalized search keywords."""
+        try:
+            rewriter_structured = await self._build_structured(
+                question, memory_context, session_id, difficulty="", current_round=0,
+            )
+            keywords = await self._rewriter.rewrite(
+                question, history=history_ctx,
+                structured_prompt=rewriter_structured,
+            )
+            logger.info("Rewriter: '%s' → %d keywords: %s",
+                         question[:50], len(keywords), keywords)
+            return keywords
+        except Exception as e:
+            logger.warning("Rewriter failed, using original question: %s", e)
+            return [question]
+
+    async def _route_question(
+        self, question: str, history_ctx: str, memory_context=None, session_id: str = "",
+    ):
+        """Classify difficulty using GSSC (preferred) or legacy ContextRouter."""
+        structured = await self._build_structured(
+            question, memory_context, session_id, difficulty="", current_round=0,
+        )
+        if structured is not None:
+            return await self._router.run(self._mk_input(
+                question=question,
+                chat_history=history_ctx,
+                structured_prompt=structured,
+            ))
+        # Legacy fallback
+        router_ctx = self._ctx_router.build_router(question, memory_context)
+        return await self._router.run(self._mk_input(
+            question=question,
+            chat_history=history_ctx,
+            router_context=router_ctx,
+        ))
 
     # ── History context builder ────────────────────────────────────
 
@@ -158,30 +242,41 @@ class QASystem:
     async def _handle_moderate(
         self, question: str, doc_filter: set[str] | None,
         chat_history: list[dict] | None,
-        seed_decomposition: list[str] | None = None,
+        decomposition: list[str] | None = None,
+        normalized_queries: list[str] | None = None,
         history_ctx: str = "",
+        memory_context=None,
+        session_id: str = "",
     ) -> dict:
-        """DirectSolver with up to MAX_MODERATE_ROUNDS retry on escalation."""
+        """Single-pass concurrent RAG → synthesize. Escalates on empty results."""
         tool_call_log: list[dict] = []
 
-        for round_num in range(1, MAX_MODERATE_ROUNDS + 1):
-            logger.info("[QA] moderate round %d/%d", round_num, MAX_MODERATE_ROUNDS)
-            result = await self._solver.run(self._mk_input(
-                question=question, doc_filter=doc_filter, chat_history=chat_history,
-            ))
-            if not result.success:
-                return {"reply": f"处理出错: {result.error}", "rounds": round_num, "tool_calls": tool_call_log, "route": "error"}
+        result = await self._solver.run(self._mk_input(
+            question=question, doc_filter=doc_filter,
+            chat_history=chat_history, history_ctx=history_ctx,
+            decomposition=decomposition or [],
+            normalized_queries=normalized_queries or [],
+        ))
+        if not result.success:
+            return {"reply": f"处理出错: {result.error}", "rounds": 1,
+                    "tool_calls": tool_call_log, "route": "error"}
 
-            meta = result.metadata
-            tool_call_log.extend(meta.get("tool_calls", []))
+        meta = result.metadata
+        tool_call_log.extend(meta.get("tool_calls", []))
 
-            if meta.get("route") == "done":
-                return {"reply": meta["reply"], "rounds": round_num, "tool_calls": tool_call_log, "route": "moderate"}
-            logger.info("[QA] moderate escalated to complex at round %d", round_num)
-            break
+        if meta.get("route") == "done":
+            self._record_episode(question, "moderate", tool_call_log, 1,
+                                 True, session_id=session_id)
+            return {"reply": meta["reply"], "rounds": 1,
+                    "tool_calls": tool_call_log, "route": "moderate"}
 
+        # Empty or insufficient results → escalate to complex
+        logger.info("[QA] moderate escalated to complex (empty results)")
         return await self._handle_complex(question, doc_filter, chat_history,
-                                          seed_decomposition)
+                                          seed_decomposition=decomposition or [],
+                                          history_ctx=history_ctx,
+                                          memory_context=memory_context,
+                                          session_id=session_id)
 
     # ── Complex path ──────────────────────────────────────────────
 
@@ -191,6 +286,7 @@ class QASystem:
         seed_decomposition: list[str] | None = None,
         history_ctx: str = "",
         memory_context=None,
+        session_id: str = "",
     ) -> dict:
         """Planner → Executor → Reflector loop with conversation context.
 
@@ -198,6 +294,7 @@ class QASystem:
             seed_decomposition: Optional initial sub-questions from Router.
             history_ctx: Pre-computed context (legacy path).
             memory_context: MemoryContext from MemoryManager.recall().
+            session_id: Current session for GSSC Gatherer.
         """
         if not history_ctx:
             history_ctx = self._build_history_context(chat_history)
@@ -205,36 +302,47 @@ class QASystem:
         feedback = ""
         last_answer = ""
         all_obs_text = ""  # Accumulated but truncated
+        final_verdict = None  # For episode recording
 
         for round_num in range(1, MAX_COMPLEX_ROUNDS + 1):
             logger.info("[QA] complex round %d/%d", round_num, MAX_COMPLEX_ROUNDS)
 
-            # ── PLAN (with typed PlannerContext) ─────
-            planner_ctx = self._ctx_router.build_planner(
-                question, memory_context,
-                seed_decomposition=seed_decomposition,
+            # ── PLAN (GSSC preferred, legacy fallback) ─────
+            planner_structured = await self._build_structured(
+                question, memory_context, session_id,
+                difficulty="complex", current_round=round_num,
                 feedback=feedback,
-                current_round=round_num,
             )
-            plan = await self._planner.plan(
-                question, feedback=feedback,
+            plan_kwargs = dict(
+                question=question, feedback=feedback,
                 history_ctx=history_ctx,
                 seed_decomposition=seed_decomposition,
-                planner_ctx=planner_ctx,
             )
+            if planner_structured is not None:
+                plan_kwargs["structured_prompt"] = planner_structured
+            else:
+                plan_kwargs["planner_ctx"] = self._ctx_router.build_planner(
+                    question, memory_context,
+                    seed_decomposition=seed_decomposition,
+                    feedback=feedback, current_round=round_num,
+                )
+            plan = await self._planner.plan(**plan_kwargs)
             if not plan:
                 logger.warning("[QA] planner returned empty plan at round %d", round_num)
                 if last_answer:
                     return {"reply": last_answer, "rounds": round_num, "tool_calls": tool_call_log, "route": "complex"}
                 fallback = await self._handle_moderate(question, doc_filter, chat_history,
-                                                         seed_decomposition=seed_decomposition)
+                                                         seed_decomposition=seed_decomposition,
+                                                         history_ctx=history_ctx,
+                                                         memory_context=memory_context,
+                                                         session_id=session_id)
                 fallback["route"] = "complex_fallback"
                 return fallback
 
             logger.info("[QA] planner: %d sub-questions", len(plan))
 
             # ── EXECUTE ──────────────────────────────────────────
-            exec_results = await self._executor.execute(plan, doc_filter)
+            exec_results = await self._executor.execute(plan, doc_filter, history_ctx=history_ctx)
             for sub_result in exec_results:
                 for r in sub_result.get("results", []):
                     if hasattr(r, "tool_name"):
@@ -243,12 +351,12 @@ class QASystem:
                             "tool": r.tool_name, "query": r.query,
                         })
 
-            # Build observation text (truncated to avoid context overflow)
+            # Build observation text
             obs_parts = []
             for sub in exec_results:
                 obs_parts.append(f"\n### 子问题 {sub.get('id')}: {sub.get('question')}")
                 for r in sub.get("results", []):
-                    obs_parts.append(f"[{r.tool_name}] {r.content[:600]}")
+                    obs_parts.append(f"[{r.tool_name}] {r.content[:800]}")
             obs_text = "\n".join(obs_parts)
 
             # Accumulate with truncation
@@ -259,36 +367,57 @@ class QASystem:
             if len(all_obs_text) > MAX_OBS_CHARS:
                 all_obs_text = "...（早期搜索结果已截断）\n" + all_obs_text[-MAX_OBS_CHARS:]
 
-            # ── Build solver context for this round ─────────────
-            solver_ctx = self._ctx_router.build_solver(
-                question, plan=plan, search_results=exec_results,
+            # ── Build solver context via GSSC (with search results) ──
+            solver_structured = await self._build_structured(
+                question, memory_context, session_id,
+                difficulty="complex", current_round=round_num,
+                planner_output=plan, search_results=exec_results,
             )
 
             # ── SOLVE ────────────────────────────────────────────
-            answer = await self._planner.solve(
-                question, obs_text, history_ctx=history_ctx,
-                solver_ctx=solver_ctx,
+            solve_kwargs = dict(
+                question=question, observations=obs_text, history_ctx=history_ctx,
             )
+            if solver_structured is not None:
+                solve_kwargs["structured_prompt"] = solver_structured
+            else:
+                solve_kwargs["solver_ctx"] = self._ctx_router.build_solver(
+                    question, plan=plan, search_results=exec_results, history_ctx=history_ctx,
+                )
+            answer = await self._planner.solve(**solve_kwargs)
             last_answer = answer
 
             # ── REFLECT (with inline fix loop) ───────────────────
             if round_num < MAX_COMPLEX_ROUNDS:
                 for fix_round in range(MAX_INLINE_FIXES + 1):
-                    # Build fresh reflector context with current answer
-                    reflector_ctx = self._ctx_router.build_reflector(
-                        question, answer=answer, observations=obs_text,
+                    # Build reflector context via GSSC (with current answer)
+                    reflector_structured = await self._build_structured(
+                        question, memory_context, session_id,
+                        difficulty="complex", current_round=round_num,
+                        search_results=exec_results, current_answer=answer,
                     )
-                    verdict = await self._reflector.review(
-                        question, answer, obs_text,
+                    review_kwargs = dict(
+                        question=question, answer=answer, observations=obs_text,
                         history_ctx=history_ctx,
-                        reflector_ctx=reflector_ctx,
                     )
+                    if reflector_structured is not None:
+                        review_kwargs["structured_prompt"] = reflector_structured
+                    else:
+                        review_kwargs["reflector_ctx"] = self._ctx_router.build_reflector(
+                            question, answer=answer, observations=obs_text,
+                        )
+                    verdict = await self._reflector.review(**review_kwargs)
                     if verdict.get("verdict") == "SUFFICIENT":
                         logger.info("[QA] reflector: SUFFICIENT at round %d (fix=%d)",
                                      round_num, fix_round)
+                        self._record_episode(
+                            question, "complex", tool_call_log, round_num, True,
+                            session_id=session_id, verdict=verdict,
+                        )
                         return {"reply": answer, "rounds": round_num,
                                 "tool_calls": tool_call_log, "route": "complex"}
 
+                    final_verdict = verdict  # save for episode recording on failure
                     ins_type = verdict.get("insufficiency_type", "plan")
                     logger.info("[QA] reflector INSUFFICIENT: type=%s round=%d fix=%d/%d",
                                  ins_type, round_num, fix_round, MAX_INLINE_FIXES)
@@ -335,7 +464,7 @@ class QASystem:
                                 f"\n### 补搜 {sub.get('id')}: {sub.get('question')}"
                             )
                             for r in sub.get("results", []):
-                                new_parts.append(f"[{r.tool_name}] {r.content[:600]}")
+                                new_parts.append(f"[{r.tool_name}] {r.content[:800]}")
                         new_obs = "\n".join(new_parts)
                         all_obs_text = (
                             all_obs_text[-MAX_OBS_CHARS // 2:]
@@ -347,14 +476,23 @@ class QASystem:
                                 + all_obs_text[-MAX_OBS_CHARS:]
                             )
 
-                        # Re-solve with accumulated observations
-                        solver_ctx = self._ctx_router.build_solver(
-                            question, plan=plan, search_results=exec_results,
+                        # Re-solve with accumulated observations (GSSC)
+                        solver_structured = await self._build_structured(
+                            question, memory_context, session_id,
+                            difficulty="complex", current_round=round_num,
+                            planner_output=plan, search_results=exec_results,
                         )
-                        answer = await self._planner.solve(
-                            question, all_obs_text, history_ctx=history_ctx,
-                            solver_ctx=solver_ctx,
+                        solve_kwargs = dict(
+                            question=question, observations=all_obs_text,
+                            history_ctx=history_ctx,
                         )
+                        if solver_structured is not None:
+                            solve_kwargs["structured_prompt"] = solver_structured
+                        else:
+                            solve_kwargs["solver_ctx"] = self._ctx_router.build_solver(
+                                question, plan=plan, search_results=exec_results,
+                            )
+                        answer = await self._planner.solve(**solve_kwargs)
                         last_answer = answer
                         continue  # re-reflect in inner loop
 
@@ -366,83 +504,85 @@ class QASystem:
                             if issues
                             else "请修正综合推理逻辑，更充分地利用搜索资料中的信息。"
                         )
-                        solver_ctx = self._ctx_router.build_solver(
-                            question, plan=plan, search_results=exec_results,
+                        solver_structured = await self._build_structured(
+                            question, memory_context, session_id,
+                            difficulty="complex", current_round=round_num,
+                            planner_output=plan, search_results=exec_results,
                         )
-                        answer = await self._planner.solve(
-                            question, all_obs_text, history_ctx=history_ctx,
-                            solver_ctx=solver_ctx,
-                            reasoning_feedback=fb,
+                        solve_kwargs = dict(
+                            question=question, observations=all_obs_text,
+                            history_ctx=history_ctx, reasoning_feedback=fb,
                         )
+                        if solver_structured is not None:
+                            solve_kwargs["structured_prompt"] = solver_structured
+                        else:
+                            solve_kwargs["solver_ctx"] = self._ctx_router.build_solver(
+                                question, plan=plan, search_results=exec_results,
+                            )
+                        answer = await self._planner.solve(**solve_kwargs)
                         last_answer = answer
                         continue  # re-reflect in inner loop
 
+        self._record_episode(question, "complex", tool_call_log, MAX_COMPLEX_ROUNDS,
+                             False, session_id=session_id, verdict=final_verdict)
         return {"reply": last_answer, "rounds": MAX_COMPLEX_ROUNDS,
                 "tool_calls": tool_call_log, "route": "complex"}
 
-    # ── Exercise Tutor path ────────────────────────────────────────
+    # ── Episode recording ────────────────────────────────────────
 
-    async def _handle_tutor(
-        self, question: str, doc_filter: set[str] | None,
-        chat_history: list[dict] | None,
-    ) -> dict:
-        """Socratic exercise tutor: search → guided response (no direct answer).
+    def _record_episode(self, question: str, route: str, tool_calls: list[dict],
+                        rounds: int, success: bool, session_id: str = "",
+                        verdict: dict | None = None):
+        """Record a structured episode from QA outcome.
 
-        Loads the "exercise_tutor" skill prompt, runs rag_search to retrieve
-        relevant textbook knowledge, then generates a Socratic-style guided
-        response that leads the student to discover the answer themselves.
+        Populates diagnosis + lesson fields from Reflector verdict when available.
         """
-        import src.skills.exercise_tutor  # noqa: F401 — trigger register_skill()
-        from src.skills import get_skill
-        skill = get_skill("exercise_tutor")
-        if skill is None:
-            return {"reply": "举一反三功能未初始化，请检查 skills 配置。",
-                    "rounds": 0, "tool_calls": [], "route": "error"}
-
-        # Phase 1: Retrieve relevant knowledge from textbooks
-        observations_text = ""
-        tool_call_log: list[dict] = []
-
-        if "rag_search" in skill.tools:
-            try:
-                result = await self._solver.run(self._mk_input(
-                    question=question, doc_filter=doc_filter,
-                    chat_history=chat_history,
-                ))
-                if result.success:
-                    meta = result.metadata
-                    for obs in meta.get("observations", []):
-                        if hasattr(obs, "content"):
-                            observations_text += obs.content + "\n\n"
-                    tool_call_log = meta.get("tool_calls", [])
-            except Exception as e:
-                logger.warning("Exercise tutor search failed: %s", e)
-                observations_text = "（暂时无法检索教材内容，请直接引导）"
-
-        if not observations_text.strip():
-            observations_text = "（未找到相关教材内容，请基于通用知识引导）"
-
-        # Phase 2: Generate Socratic guided response
-        history_ctx = self._build_history_context(chat_history)
-        prompt = skill.system_prompt.format(
-            question=question,
-            observations=observations_text,
-            chat_history=history_ctx or "（新对话）",
-        )
-
+        if self._memory is None or self._memory.episodic is None:
+            return
         try:
-            llm = self._solver._make_llm(temperature=0.3)   # Slight warmth for natural tutoring
-            from langchain_core.messages import HumanMessage, SystemMessage
-            resp = await llm.ainvoke([
-                SystemMessage(content=prompt),
-                HumanMessage(content="请开始引导学生。"),
-            ])
-            reply = resp.content if hasattr(resp, "content") else str(resp)
-        except Exception as e:
-            logger.error("Exercise tutor LLM failed: %s", e)
-            reply = f"抱歉，生成引导式回答时出错: {e}"
+            ep_data: dict = {
+                "task": {"goal": question, "type": route},
+                "context": {},
+                "actions": [{"type": "qa", "tool_calls": tool_calls[:10]}],
+                "observations": [
+                    f"路由: {route}",
+                    f"轮数: {rounds}",
+                    f"工具调用: {len(tool_calls)} 次",
+                ],
+                "outcome": {"success": success},
+                "reflection": {},
+            }
+            if verdict is not None:
+                ins_type = verdict.get("insufficiency_type", "")
+                ep_data["insufficiency_type"] = ins_type
+                ep_data["failure_stage"] = self._ins_type_to_stage(ins_type)
+                ep_data["missing_aspects"] = verdict.get("missing", [])
+                ep_data["suggested_queries"] = verdict.get("suggested_queries", [])
+                if ins_type == "plan":
+                    ep_data["lesson"] = "任务分解不完整，需要检查子问题覆盖维度"
+                    ep_data["corrected_behavior"] = "分解后显式检查：定义/公式/对比/应用四个维度"
+                elif ins_type == "knowledge":
+                    ep_data["lesson"] = "搜索词未命中，需要换同义词或更精确的术语"
+                    ep_data["corrected_behavior"] = f"尝试搜索: {'; '.join(verdict.get('suggested_queries', [])[:3])}"
+                elif ins_type == "reasoning":
+                    ep_data["lesson"] = "资料已充足但综合推理有缺陷"
+                    issues = verdict.get("issues", [])
+                    ep_data["corrected_behavior"] = f"修正: {'; '.join(issues[:3])}" if issues else "更充分地利用搜索资料"
+            elif success:
+                ep_data["failure_stage"] = "none"
+                ep_data["good_pattern"] = f"{route} 路径一次成功"
+                ep_data["lesson"] = f"{route} 路径处理此问题有效"
 
-        return {"reply": reply, "rounds": 1, "tool_calls": tool_call_log, "route": "tutor"}
+            self._memory.episodic.record(ep_data, session_id=session_id,
+                                         user_id=getattr(self, '_user_id', ''))
+        except Exception as e:
+            logger.warning("Failed to record episode: %s", e)
+
+    @staticmethod
+    def _ins_type_to_stage(ins_type: str) -> str:
+        """Map Reflector insufficiency_type to failure_stage."""
+        return {"plan": "planner.plan", "knowledge": "rewriter",
+                "reasoning": "planner.solve"}.get(ins_type, "")
 
     @staticmethod
     def _mk_input(**metadata) -> object:
@@ -494,11 +634,13 @@ class QASystem:
 _agent: QASystem | None = None
 
 
-def get_agent(config: Configuration, gssc_pipeline=None, rag_skill=None) -> QASystem:
+def get_agent(config: Configuration, gssc_pipeline=None, rag_skill=None,
+              memory_manager=None) -> QASystem:
     """Get or create the QASystem singleton."""
     global _agent
     if _agent is None:
-        _agent = QASystem(config, gssc_pipeline=gssc_pipeline, rag_skill=rag_skill)
+        _agent = QASystem(config, gssc_pipeline=gssc_pipeline, rag_skill=rag_skill,
+                          memory_manager=memory_manager)
     return _agent
 
 

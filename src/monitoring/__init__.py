@@ -14,8 +14,14 @@ import os
 import time
 from typing import Any, Optional
 
-from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.outputs import LLMResult
+try:
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.outputs import LLMResult
+    _LANGCGAIN_AVAILABLE = True
+except ImportError:
+    _LANGCGAIN_AVAILABLE = False
+    BaseCallbackHandler = object  # type: ignore
+    LLMResult = object  # type: ignore
 
 from .store import TokenRecord, get_token_store
 

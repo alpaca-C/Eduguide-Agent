@@ -108,27 +108,45 @@ class ConversationSource(Source):
 
 
 class EpisodicSource(Source):
-    """Relevant past experiences from EpisodicMemory."""
+    """Relevant past experiences from EpisodicMemory.
+
+    Accepts MemoryContext via runtime to avoid redundant ChromaDB queries
+    (MemoryManager.recall() already called episodic.recall()).
+    """
 
     def __init__(self, memory_manager):
         super().__init__(priority=1)
         self._mm = memory_manager
 
     async def fetch(self, question: str, session_id: str, **runtime) -> list[Fragment]:
-        try:
-            episodes = self._mm.episodic.recall(question, top_k=3)
-        except Exception as e:
-            logger.warning("EpisodicSource failed: %s", e)
-            return []
+        # Prefer episodes from runtime MemoryContext (avoids double ChromaDB query)
+        mem_ctx = runtime.get("memory_context")
+        if mem_ctx is not None and hasattr(mem_ctx, 'episodes'):
+            episodes = mem_ctx.episodes or []
+        else:
+            try:
+                episodes = self._mm.episodic.recall(question, top_k=3)
+            except Exception as e:
+                logger.warning("EpisodicSource failed: %s", e)
+                return []
 
         fragments = []
         for ep in episodes:
             parts = [f"历史经验: {ep.task_goal}"]
             if ep.observations:
                 parts.append(f"观察: {'; '.join(ep.observations[:3])}")
-            lesson = ep.reflection.get("lesson", "")
+            # Prefer structured lesson field (new), fall back to reflection dict (legacy)
+            lesson = getattr(ep, 'lesson', '') or ep.reflection.get("lesson", "")
             if lesson:
                 parts.append(f"教训: {lesson}")
+            # Include corrected_behavior if available
+            corrected = getattr(ep, 'corrected_behavior', '')
+            if corrected:
+                parts.append(f"改进方向: {corrected}")
+            # Include good_pattern (positive reinforcement)
+            good = getattr(ep, 'good_pattern', '')
+            if good:
+                parts.append(f"正面经验: {good}")
             fragments.append(Fragment(
                 source="episodic",
                 content="\n".join(parts),
@@ -136,6 +154,7 @@ class EpisodicSource(Source):
                 metadata={
                     "episode_id": ep.id,
                     "task_type": ep.task_type,
+                    "failure_stage": getattr(ep, 'failure_stage', ''),
                     "timestamp": ep.created_at,
                 },
             ))
@@ -218,6 +237,47 @@ class ToolSource(Source):
         )]
 
 
+class PlannerOutputSource(Source):
+    """Planner's sub-question plan — context for Solver and Reflector."""
+
+    def __init__(self):
+        super().__init__(priority=1)
+
+    async def fetch(self, question: str, session_id: str, **runtime) -> list[Fragment]:
+        plan = runtime.get("planner_output") or []
+        if not plan:
+            return []
+        lines = ["当前计划的子问题:"]
+        for s in plan:
+            tool = s.get("tool", "rag_search")
+            lines.append(f"- {s.get('id')}. {s.get('question')} (工具: {tool})")
+        return [Fragment(
+            source="search_result",
+            content="\n".join(lines),
+            priority=self.priority,
+            metadata={"sub_question_count": len(plan)},
+        )]
+
+
+class ReflectorTargetSource(Source):
+    """The answer currently being reviewed — for Reflector."""
+
+    def __init__(self):
+        super().__init__(priority=2)
+
+    async def fetch(self, question: str, session_id: str, **runtime) -> list[Fragment]:
+        answer = runtime.get("current_answer") or ""
+        if not answer:
+            return []
+        preview = answer[:800] + "..." if len(answer) > 800 else answer
+        return [Fragment(
+            source="review_target",
+            content=f"待审核回答:\n{preview}",
+            priority=self.priority,
+            metadata={"answer_length": len(answer)},
+        )]
+
+
 # ── Gatherer ────────────────────────────────────────────────────────────────
 
 class Gatherer:
@@ -235,9 +295,11 @@ class Gatherer:
             self._sources.append(ConversationSource(memory_manager))
             self._sources.append(EpisodicSource(memory_manager))
 
-        # Runtime sources (fed by Executor output)
+        # Runtime sources (fed by Executor output / Planner output / Reflector target)
         self._sources.append(SearchResultSource())
         self._sources.append(KGConceptSource())
+        self._sources.append(PlannerOutputSource())
+        self._sources.append(ReflectorTargetSource())
 
         # Tool registry
         self._sources.append(ToolSource(tool_registry or {}))
